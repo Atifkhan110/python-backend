@@ -10,7 +10,7 @@ app = Flask(__name__)
 CORS(app)
 
 DB_NAME = "labour_portal.db"
-ADMIN_PIN = "2026"  # Admin security PIN to unlock delete privileges
+ADMIN_PIN = "9999"  # Admin security password
 
 # ─────────────────────────────────────────────────────────────
 # 1. DATABASE SETUP & AUTOMATIC SCHEMA MIGRATION
@@ -24,7 +24,6 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Create tables if not present
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS labours (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +55,7 @@ def init_db():
         )
     """)
 
-    # 2. Schema migration safety: check for new columns if DB existed
+    # Schema migration safety
     cursor.execute("PRAGMA table_info(labours)")
     labour_cols = [c[1] for c in cursor.fetchall()]
     if "assigned_contractor" not in labour_cols:
@@ -67,7 +66,7 @@ def init_db():
     if "photo_data" not in job_cols:
         cursor.execute("ALTER TABLE contractor_jobs ADD COLUMN photo_data TEXT DEFAULT ''")
 
-    # 3. Seed initial records if empty
+    # Seed demo data if database is empty
     cursor.execute("SELECT COUNT(*) FROM labours")
     if cursor.fetchone()[0] == 0:
         cursor.executemany("""
@@ -89,7 +88,7 @@ def init_db():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [
             ("Apex Infra Builders", "+91 99887 76655", "Hyderabad, Hitec City", "Masonry & RCC Slab", 6, "₹900 / day", "Need 6 experienced masons for high-rise commercial slab work. On-site accommodation and meals provided.", "", "Open"),
-            ("Home Renovation - Amit (Homeowner)", "+91 98776 65544", "Delhi, Dwarka Sector 12", "Bathroom Tile Leakage Repair", 2, "₹850 / day", "Tile leakage in 2 bathrooms. Need master plumber and tile fitter. Immediate work.", "", "Open")
+            ("Home Renovation - Amit", "+91 98776 65544", "Delhi, Dwarka Sector 12", "Bathroom Tile Leakage Repair", 2, "₹850 / day", "Tile leakage in 2 bathrooms. Need master plumber and tile fitter. Immediate work.", "", "Open")
         ])
 
     conn.commit()
@@ -98,7 +97,7 @@ def init_db():
 init_db()
 
 # ─────────────────────────────────────────────────────────────
-# 2. FRONTEND APPLICATION (ADVANCED TRILINGUAL UI)
+# 2. FRONTEND APPLICATION WITH ROLE-BASED ENTRY GATE
 # ─────────────────────────────────────────────────────────────
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -131,7 +130,108 @@ HTML_TEMPLATE = """
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", sans-serif; }
         body { background-color: var(--bg-main); color: var(--text-primary); min-height: 100vh; display: flex; flex-direction: column; }
 
-        /* ANNOUNCEMENT */
+        /* ─────────────────────────────────────────────────────────────
+           FULL-SCREEN ENTRY GATE (USER VS ADMIN SELECTION)
+        ───────────────────────────────────────────────────────────── */
+        #roleGateOverlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(180deg, rgba(7, 10, 18, 0.94) 0%, rgba(11, 17, 32, 0.98) 100%),
+                        url('https://images.unsplash.com/photo-1541888946425-d0fbb186156a?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
+            z-index: 20000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .gate-card {
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            max-width: 520px;
+            width: 100%;
+            padding: 40px 30px;
+            text-align: center;
+            box-shadow: 0 25px 60px rgba(0,0,0,0.8);
+        }
+        .gate-icon {
+            width: 64px;
+            height: 64px;
+            background: linear-gradient(135deg, var(--accent-gold), #b45309);
+            color: #000;
+            border-radius: 16px;
+            font-size: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px auto;
+            box-shadow: 0 8px 25px rgba(245, 158, 11, 0.4);
+        }
+        .gate-title { font-size: 26px; font-weight: 900; margin-bottom: 6px; }
+        .gate-title span { color: var(--accent-gold); }
+        .gate-subtitle { font-size: 14px; color: var(--text-secondary); margin-bottom: 30px; }
+        
+        .role-options {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .role-btn {
+            background: #090d16;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            cursor: pointer;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            transition: all 0.2s;
+        }
+        .role-btn:hover {
+            border-color: var(--accent-gold);
+            transform: translateY(-2px);
+            background: #111a2e;
+        }
+        .role-icon-box {
+            width: 48px;
+            height: 48px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            flex-shrink: 0;
+        }
+        .role-info h3 { font-size: 17px; color: #fff; margin-bottom: 4px; }
+        .role-info p { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
+
+        /* ADMIN PASSWORD MODAL / FORM */
+        #adminPinView {
+            display: none;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+            text-align: center;
+        }
+        .pin-mask-input {
+            width: 180px;
+            letter-spacing: 12px;
+            font-size: 28px;
+            text-align: center;
+            padding: 12px;
+            background: #070a12;
+            border: 2px solid var(--accent-gold);
+            border-radius: 10px;
+            color: #fff;
+            margin-bottom: 16px;
+        }
+        .pin-mask-input:focus { outline: none; box-shadow: 0 0 15px rgba(245, 158, 11, 0.4); }
+
+        /* ─────────────────────────────────────────────────────────────
+           MAIN PORTAL STYLING
+        ───────────────────────────────────────────────────────────── */
         .top-announcement {
             background: linear-gradient(90deg, #1e1b4b, #312e81, #1e1b4b);
             border-bottom: 1px solid rgba(99, 102, 241, 0.3);
@@ -143,7 +243,6 @@ HTML_TEMPLATE = """
         }
         .top-announcement span { color: var(--accent-gold); font-weight: 700; }
 
-        /* NAVBAR */
         header {
             background: rgba(7, 10, 18, 0.94);
             backdrop-filter: blur(16px);
@@ -209,7 +308,7 @@ HTML_TEMPLATE = """
             box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
         }
 
-        .admin-status-pill {
+        .admin-badge {
             display: none;
             align-items: center;
             gap: 6px;
@@ -222,7 +321,6 @@ HTML_TEMPLATE = """
             font-weight: 700;
         }
 
-        /* HERO WITH BACKGROUND PICTURE */
         .hero {
             position: relative;
             background: linear-gradient(180deg, rgba(7, 10, 18, 0.88) 0%, rgba(11, 17, 32, 0.97) 100%),
@@ -278,7 +376,6 @@ HTML_TEMPLATE = """
         .stat-num { font-size: 26px; font-weight: 900; color: var(--accent-gold); }
         .stat-txt { font-size: 12px; color: var(--text-secondary); margin-top: 4px; font-weight: 600; }
 
-        /* TABS */
         .tabs-bar {
             max-width: 1200px;
             margin: 20px auto 16px auto;
@@ -311,7 +408,9 @@ HTML_TEMPLATE = """
             box-shadow: 0 4px 18px rgba(245, 158, 11, 0.3);
         }
 
-        /* MAIN CONTENT */
+        /* ADMIN TAB: HIDDEN FOR USERS BY DEFAULT */
+        #btn-backup { display: none; }
+
         main {
             max-width: 1200px;
             margin: 0 auto;
@@ -320,7 +419,6 @@ HTML_TEMPLATE = """
             width: 100%;
         }
 
-        /* FILTER */
         .filter-bar {
             display: flex;
             gap: 12px;
@@ -349,7 +447,6 @@ HTML_TEMPLATE = """
             font-size: 14px;
         }
 
-        /* CARDS */
         .items-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -428,7 +525,6 @@ HTML_TEMPLATE = """
             border: 1px solid rgba(245, 158, 11, 0.25);
         }
 
-        /* SITE PHOTO DISPLAY IN JOB CARDS */
         .job-photo-preview {
             width: 100%;
             height: 160px;
@@ -441,7 +537,6 @@ HTML_TEMPLATE = """
         }
         .job-photo-preview:hover { opacity: 0.9; }
 
-        /* ACTION BUTTONS ON CARDS */
         .btn-group {
             display: flex;
             gap: 8px;
@@ -521,7 +616,7 @@ HTML_TEMPLATE = """
             gap: 6px;
         }
 
-        /* ADMIN DELETE BUTTON (HIDDEN UNTIL UNLOCKED) */
+        /* ADMIN DELETE BUTTONS: TOTALLY HIDDEN UNLESS ADMIN MODE IS ACTIVE */
         .btn-admin-delete {
             display: none;
             background: rgba(239, 68, 68, 0.12);
@@ -536,10 +631,10 @@ HTML_TEMPLATE = """
             margin-top: 6px;
             text-align: center;
         }
-        .admin-unlocked .btn-admin-delete { display: block; }
-        .admin-unlocked .admin-status-pill { display: flex; }
+        body.is-admin .btn-admin-delete { display: block; }
+        body.is-admin .admin-badge { display: flex; }
+        body.is-admin #btn-backup { display: flex; }
 
-        /* FORMS */
         .form-card {
             background: var(--bg-card);
             backdrop-filter: blur(12px);
@@ -579,7 +674,6 @@ HTML_TEMPLATE = """
         }
         .btn-submit:hover { opacity: 0.95; }
 
-        /* PHOTO UPLOAD PREVIEW */
         .photo-preview-box {
             display: none;
             margin-top: 10px;
@@ -590,7 +684,6 @@ HTML_TEMPLATE = """
         }
         .photo-preview-box img { width: 100%; height: 180px; object-fit: cover; }
 
-        /* BACKUP & ADMIN SECTION */
         .backup-card {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -612,7 +705,6 @@ HTML_TEMPLATE = """
             gap: 16px;
         }
 
-        /* MODAL */
         .modal-overlay {
             display: none;
             position: fixed;
@@ -644,7 +736,6 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
 
-        /* FLOATING WHATSAPP */
         .floating-whatsapp {
             position: fixed;
             bottom: 24px;
@@ -665,7 +756,6 @@ HTML_TEMPLATE = """
         }
         .floating-whatsapp:hover { transform: scale(1.1); }
 
-        /* FOOTER */
         footer {
             background: #04070d;
             border-top: 1px solid var(--border-color);
@@ -705,7 +795,7 @@ HTML_TEMPLATE = """
             border-radius: 10px;
             padding: 16px;
             position: fixed;
-            z-index: 9999;
+            z-index: 99999;
             left: 50%;
             bottom: 30px;
             transform: translateX(-50%);
@@ -725,7 +815,55 @@ HTML_TEMPLATE = """
         }
     </style>
 </head>
-<body id="appBody">
+<body>
+
+    <!-- ─────────────────────────────────────────────────────────────
+         FULL SCREEN ENTRY GATE
+    ───────────────────────────────────────────────────────────── -->
+    <div id="roleGateOverlay">
+        <div class="gate-card">
+            <div class="gate-icon"><i class="fa-solid fa-helmet-safety"></i></div>
+            <h2 class="gate-title">Welcome to Shramik<span>Link</span></h2>
+            <p class="gate-subtitle">Please select your access profile to continue</p>
+
+            <div class="role-options" id="roleSelectionView">
+                <!-- USER BUTTON: ENTERS DIRECTLY WITHOUT ASKING ANYTHING -->
+                <div class="role-btn" onclick="enterAsUser()">
+                    <div class="role-icon-box" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8;">
+                        <i class="fa-solid fa-users"></i>
+                    </div>
+                    <div class="role-info">
+                        <h3>I am a User / Public</h3>
+                        <p>Find skilled labours, post job requirements & direct WhatsApp / Call. (No password required)</p>
+                    </div>
+                </div>
+
+                <!-- ADMIN BUTTON: OPENS PASSWORD INPUT -->
+                <div class="role-btn" onclick="showAdminPinPrompt()">
+                    <div class="role-icon-box" style="background: rgba(245, 158, 11, 0.15); color: var(--accent-gold);">
+                        <i class="fa-solid fa-user-shield"></i>
+                    </div>
+                    <div class="role-info">
+                        <h3>I am an Admin</h3>
+                        <p>Authorized personnel management, profile deletion & database backup controls.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- MASKED ADMIN PIN PROMPT (BULLET MASKED ••••) -->
+            <div id="adminPinView">
+                <h3 style="font-size: 18px; margin-bottom: 8px; color: #fff;"><i class="fa-solid fa-lock" style="color: var(--accent-gold);"></i> Enter Admin Security PIN</h3>
+                <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 16px;">Digits are masked with bullets for screen and keyboard privacy.</p>
+                
+                <input type="password" id="gateAdminPin" class="pin-mask-input" maxlength="4" placeholder="••••" autocomplete="off">
+                
+                <div style="display: flex; gap: 10px; justify-content: center;">
+                    <button class="tab-btn" onclick="cancelAdminLogin()"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                    <button class="tab-btn active" onclick="submitAdminPin()"><i class="fa-solid fa-unlock"></i> Login as Admin</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- ANNOUNCEMENT BAR -->
     <div class="top-announcement">
@@ -745,7 +883,7 @@ HTML_TEMPLATE = """
             </a>
             
             <div class="nav-actions">
-                <div class="admin-status-pill"><i class="fa-solid fa-user-shield"></i> Admin Mode</div>
+                <div class="admin-badge"><i class="fa-solid fa-user-shield"></i> Admin Logged In</div>
                 <div class="lang-switch">
                     <button class="lang-btn active" id="lang-en" onclick="setLanguage('en')">EN</button>
                     <button class="lang-btn" id="lang-hi" onclick="setLanguage('hi')">हिन्दी</button>
@@ -755,7 +893,7 @@ HTML_TEMPLATE = """
         </div>
     </header>
 
-    <!-- HERO SECTION WITH ARCHITECTURAL BACKGROUND -->
+    <!-- HERO SECTION -->
     <div class="hero">
         <div class="hero-badge">
             <i class="fa-solid fa-shield-check"></i> <span id="txt-verifiedBadge">Verified Workers & Contractors</span>
@@ -793,8 +931,9 @@ HTML_TEMPLATE = """
         <button class="tab-btn" id="btn-post-job" onclick="switchTab('tab-post-job')">
             <i class="fa-solid fa-camera"></i> <span id="lbl-tabPostJob">Post Requirement & Photo</span>
         </button>
+        <!-- ADMIN ONLY TAB: TOTALLY HIDDEN FOR USERS -->
         <button class="tab-btn" id="btn-backup" onclick="switchTab('tab-backup')">
-            <i class="fa-solid fa-user-shield"></i> <span id="lbl-tabBackup">Admin & Backup</span>
+            <i class="fa-solid fa-user-shield"></i> <span id="lbl-tabBackup">Admin Management</span>
         </button>
     </div>
 
@@ -831,7 +970,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 3: REGISTER WORKER (WITH UNIQUE PHONE VALIDATION) -->
+        <!-- TAB 3: REGISTER WORKER -->
         <div id="tab-reg-labour" class="tab-content" style="display: none;">
             <div class="form-card">
                 <h3 class="form-title"><i class="fa-solid fa-id-card" style="color: var(--accent-gold);"></i> <span id="form-workerTitle">Register as Worker</span></h3>
@@ -878,11 +1017,11 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 4: POST REQUIREMENT (WITH PHOTO UPLOAD FOR HOMEOWNERS & CONTRACTORS) -->
+        <!-- TAB 4: POST REQUIREMENT -->
         <div id="tab-post-job" class="tab-content" style="display: none;">
             <div class="form-card">
                 <h3 class="form-title"><i class="fa-solid fa-camera" style="color: var(--accent-gold);"></i> <span id="form-jobTitle">Post Job Requirement with Photo</span></h3>
-                <p class="form-desc" id="form-jobDesc">Contractors or homeowners can post requirements and upload a photo of the work site or problem (e.g. wall cracks, water leakage) so labours see the job!</p>
+                <p class="form-desc" id="form-jobDesc">Contractors or homeowners can post requirements and upload a photo of the work site or problem.</p>
 
                 <form id="formJob" onsubmit="submitJob(event)">
                     <div class="form-group">
@@ -912,7 +1051,7 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                     <div class="form-group">
-                        <label class="form-label">📷 Upload Photo of Work / Problem (Optional for Homeowners & Contractors)</label>
+                        <label class="form-label">📷 Upload Photo of Work / Problem (Optional)</label>
                         <input type="file" id="jobPhotoInput" accept="image/*" class="form-input" onchange="previewJobPhoto(event)">
                         <div id="jobPhotoPreviewBox" class="photo-preview-box">
                             <img id="jobPhotoPreviewImg" src="" alt="Work Photo Preview">
@@ -927,25 +1066,12 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 5: ADMIN SECURITY & BACKUP -->
+        <!-- TAB 5: ADMIN MANAGEMENT (ACCESSIBLE ONLY TO ADMIN) -->
         <div id="tab-backup" class="tab-content" style="display: none;">
             <div class="backup-card">
-                <h3 class="form-title"><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin Control & Data Backup</h3>
-                <p class="form-desc">Protected zone. Regular users cannot delete profiles. Enter Admin PIN to manage spam records or download backups.</p>
+                <h3 class="form-title"><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin Control Center</h3>
+                <p class="form-desc">Full administrative authority unlocked. You can remove spam records or download complete snapshots.</p>
 
-                <!-- ADMIN PIN UNLOCK -->
-                <div class="backup-row">
-                    <div>
-                        <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-key" style="color: var(--accent-gold);"></i> Admin Security Mode</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary);">Enter Admin PIN to unlock delete buttons on worker and contractor cards.</p>
-                    </div>
-                    <div style="display: flex; gap: 8px;">
-                        <input type="password" id="adminPinInput" placeholder="Enter PIN (2026)" style="width: 140px; padding: 10px; background: #070a12; border: 1px solid var(--border-color); color: #fff; border-radius: 8px;">
-                        <button class="tab-btn active" onclick="unlockAdmin()"><i class="fa-solid fa-lock-open"></i> Unlock</button>
-                    </div>
-                </div>
-
-                <!-- 1-CLICK BACKUP -->
                 <div class="backup-row">
                     <div>
                         <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-download" style="color: var(--accent-gold);"></i> 1-Click Database Backup</h4>
@@ -956,7 +1082,6 @@ HTML_TEMPLATE = """
                     </a>
                 </div>
 
-                <!-- RESTORE BACKUP -->
                 <div class="backup-row">
                     <div>
                         <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-rotate-left" style="color: var(--accent-blue);"></i> Restore Database</h4>
@@ -970,11 +1095,10 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <!-- GMAIL HELP QUERY SECTION -->
                 <div class="backup-row" style="background: rgba(30, 41, 59, 0.5); border-color: rgba(56, 189, 248, 0.4);">
                     <div>
                         <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-envelope" style="color: var(--accent-blue);"></i> Help & Team Support (Gmail)</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary);">Have a query or feedback? Email our team directly.</p>
+                        <p style="font-size: 13px; color: var(--text-secondary);">Send team inquiry to official support mailbox.</p>
                     </div>
                     <a href="mailto:support.shramiklink@gmail.com?subject=ShramikLink%20Inquiry%20from%20Website" class="tab-btn active" style="text-decoration: none;">
                         <i class="fa-solid fa-paper-plane"></i> Email via Gmail
@@ -985,7 +1109,7 @@ HTML_TEMPLATE = """
 
     </main>
 
-    <!-- HIRE / ASSIGN CONTRACTOR MODAL -->
+    <!-- HIRE MODAL -->
     <div id="hireModal" class="modal-overlay">
         <div class="modal-content">
             <button class="btn-modal-close" onclick="closeHireModal()">&times;</button>
@@ -999,14 +1123,14 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- IMAGE LIGHTBOX MODAL -->
+    <!-- LIGHTBOX -->
     <div id="imageLightbox" class="modal-overlay" onclick="closeLightbox()">
         <div style="max-width: 90%; max-height: 90%;">
             <img id="lightboxImg" src="" style="width: 100%; height: auto; max-height: 80vh; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.8);">
         </div>
     </div>
 
-    <!-- FLOATING WHATSAPP BUTTON -->
+    <!-- FLOATING WHATSAPP -->
     <a href="https://wa.me/919876543210?text=Hello%20ShramikLink%20Support,%20I%20need%20help%20with%20finding%20workers." target="_blank" class="floating-whatsapp" title="Chat on WhatsApp">
         <i class="fa-brands fa-whatsapp"></i>
     </a>
@@ -1033,14 +1157,13 @@ HTML_TEMPLATE = """
                 <ul>
                     <li><a href="mailto:support.shramiklink@gmail.com"><i class="fa-solid fa-envelope"></i> support.shramiklink@gmail.com</a></li>
                     <li><a href="https://wa.me/919876543210"><i class="fa-brands fa-whatsapp"></i> WhatsApp Help Line</a></li>
-                    <li><a href="#" onclick="switchTab('tab-backup')"><i class="fa-solid fa-shield-halved"></i> Admin Portal</a></li>
                 </ul>
             </div>
             <div class="footer-col">
                 <h4>Trust & Privacy</h4>
                 <p><i class="fa-solid fa-lock" style="color: var(--success);"></i> 256-Bit SSL Encrypted</p>
                 <p><i class="fa-solid fa-ban" style="color: var(--danger);"></i> One Number per Person</p>
-                <p><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin PIN Protected Deletion</p>
+                <p><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin Password Protected</p>
             </div>
         </div>
         <div class="footer-bottom">
@@ -1057,8 +1180,50 @@ HTML_TEMPLATE = """
         let currentAdminPin = '';
         let activeHireLabourId = null;
         let jobPhotoBase64 = '';
+        let userRole = 'none';
 
-        // MULTILINGUAL DICTIONARY (EN / HI / TE)
+        // ─────────────────────────────────────────────
+        // ROLE GATEWAY FUNCTIONS
+        // ─────────────────────────────────────────────
+        function enterAsUser() {
+            userRole = 'user';
+            // Hide the gateway overlay
+            document.getElementById('roleGateOverlay').style.display = 'none';
+            // Ensure no admin elements are visible
+            document.body.classList.remove('is-admin');
+            document.getElementById('btn-backup').style.display = 'none';
+            showToast("Welcome to ShramikLink!");
+        }
+
+        function showAdminPinPrompt() {
+            document.getElementById('roleSelectionView').style.display = 'none';
+            document.getElementById('adminPinView').style.display = 'block';
+            document.getElementById('gateAdminPin').focus();
+        }
+
+        function cancelAdminLogin() {
+            document.getElementById('adminPinView').style.display = 'none';
+            document.getElementById('roleSelectionView').style.display = 'flex';
+            document.getElementById('gateAdminPin').value = '';
+        }
+
+        function submitAdminPin() {
+            const pin = document.getElementById('gateAdminPin').value.trim();
+            if (pin === "9999") {
+                userRole = 'admin';
+                currentAdminPin = pin;
+                document.body.classList.add('is-admin');
+                document.getElementById('roleGateOverlay').style.display = 'none';
+                showToast("Admin access granted! Management tools unlocked 🛡️");
+                renderLabours(allLabours);
+                renderJobs(allJobs);
+            } else {
+                showToast("Incorrect Password! Access denied.", true);
+                document.getElementById('gateAdminPin').value = '';
+            }
+        }
+
+        // MULTILINGUAL DICTIONARY
         const i18n = {
             en: {
                 announcement: "National Direct Labour & Contractor Network • 0% Brokerage • 100% Free Direct Calling",
@@ -1073,7 +1238,7 @@ HTML_TEMPLATE = """
                 tabJobs: "Contractor Jobs",
                 tabRegWorker: "Register Worker",
                 tabPostJob: "Post Requirement & Photo",
-                tabBackup: "Admin & Backup",
+                tabBackup: "Admin Management",
                 workerTitle: "Register as Worker",
                 workerDesc: "Enter your trade and phone to receive direct daily job calls from local contractors.",
                 jobTitle: "Post Job Requirement with Photo",
@@ -1097,7 +1262,7 @@ HTML_TEMPLATE = """
                 tabJobs: "ठेकेदार के काम",
                 tabRegWorker: "मजदूर पंजीकरण",
                 tabPostJob: "काम व फोटो पोस्ट करें",
-                tabBackup: "एडमिन और बैकअप",
+                tabBackup: "एडमिन प्रबंधन",
                 workerTitle: "मजदूर के रूप में पंजीकरण करें",
                 workerDesc: "स्थानीय ठेकेदारों से सीधे काम के कॉल प्राप्त करने के लिए अपना विवरण दर्ज करें।",
                 jobTitle: "फोटो के साथ काम पोस्ट करें",
@@ -1121,7 +1286,7 @@ HTML_TEMPLATE = """
                 tabJobs: "కాంట్రాక్టర్ పనులు",
                 tabRegWorker: "వర్కర్ రిజిస్ట్రేషన్",
                 tabPostJob: "పని & ఫోటో పోస్ట్ చేయండి",
-                tabBackup: "అడ్మిన్ & బ్యాకప్",
+                tabBackup: "అడ్మిన్ మేనేజ్‌మెంట్",
                 workerTitle: "వర్కర్‌గా నమోదు చేసుకోండి",
                 workerDesc: "కాంట్రాక్టర్ల నుండి నేరుగా కాల్స్ పొందడానికి మీ వివరాలను నమోదు చేయండి.",
                 jobTitle: "ఫోటోతో పని అవసరాన్ని పోస్ట్ చేయండి",
@@ -1216,18 +1381,6 @@ HTML_TEMPLATE = """
             document.getElementById('imageLightbox').style.display = 'none';
         }
 
-        function unlockAdmin() {
-            const pin = document.getElementById('adminPinInput').value.trim();
-            if (pin === "2026") {
-                currentAdminPin = pin;
-                document.getElementById('appBody').classList.add('admin-unlocked');
-                showToast("Admin Mode Unlocked! Delete buttons are now active 🛡️");
-                document.getElementById('adminPinInput').value = '';
-            } else {
-                showToast("Invalid Admin PIN! Access denied.", true);
-            }
-        }
-
         async function fetchAllData() {
             try {
                 const [labRes, jobRes] = await Promise.all([
@@ -1283,7 +1436,6 @@ HTML_TEMPLATE = """
                     </div>
 
                     <div>
-                        <!-- BESIDE CALL WORKER: MESSAGE IN WHATSAPP -->
                         <div class="btn-group">
                             <a href="tel:${l.phone}" class="btn-call">
                                 <i class="fa-solid fa-phone"></i> ${t.callWorker}
@@ -1293,7 +1445,6 @@ HTML_TEMPLATE = """
                             </a>
                         </div>
 
-                        <!-- CONTRACTOR ASSIGNMENT / BUSY STATUS -->
                         ${isBusy ? `
                             <button class="btn-release" onclick="releaseLabour(${l.id})">
                                 <i class="fa-solid fa-circle-check"></i> ${t.releaseBtn}
@@ -1336,7 +1487,6 @@ HTML_TEMPLATE = """
                         <div class="card-row"><i class="fa-solid fa-location-dot"></i> <b>Site:</b> ${j.location}</div>
                         <div class="wage-tag"><i class="fa-solid fa-coins"></i> Offered: ${j.wage_offered}</div>
                         
-                        <!-- HOMEOWNER / SITE PHOTO IF PRESENT -->
                         ${j.photo_data ? `
                             <div style="font-size: 11px; color: var(--accent-gold); font-weight: 700; margin-top: 6px;">📷 Work / Problem Photo (Click to zoom):</div>
                             <img src="${j.photo_data}" class="job-photo-preview" onclick="openLightbox('${j.photo_data}')" alt="Work Photo">
@@ -1397,9 +1547,6 @@ HTML_TEMPLATE = """
             renderJobs(filtered);
         }
 
-        // ─────────────────────────────────────────────
-        // SUBMIT LABOUR WITH ONE NUMBER VALIDATION
-        // ─────────────────────────────────────────────
         async function submitLabour(e) {
             e.preventDefault();
             const phone = document.getElementById('labPhone').value.trim();
@@ -1426,14 +1573,10 @@ HTML_TEMPLATE = """
                 await fetchAllData();
                 switchTab('tab-labours');
             } else {
-                // Return "This number is already used"
                 showToast(result.error || "This mobile number is already registered!", true);
             }
         }
 
-        // ─────────────────────────────────────────────
-        // SUBMIT JOB WITH OPTIONAL PHOTO
-        // ─────────────────────────────────────────────
         async function submitJob(e) {
             e.preventDefault();
             const data = {
@@ -1465,9 +1608,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ─────────────────────────────────────────────
-        // HIRE / ASSIGN CONTRACTOR LOGIC
-        // ─────────────────────────────────────────────
         function openHireModal(labourId) {
             activeHireLabourId = labourId;
             document.getElementById('hireModal').style.display = 'flex';
@@ -1514,9 +1654,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ─────────────────────────────────────────────
-        // ADMIN-ONLY DELETE API CALLS
-        // ─────────────────────────────────────────────
         async function adminDeleteLabour(id) {
             if (!confirm("Admin Action: Remove this worker profile permanently?")) return;
             const res = await fetch('/api/labours/' + id, {
@@ -1527,7 +1664,7 @@ HTML_TEMPLATE = """
                 showToast("Worker removed by Admin");
                 fetchAllData();
             } else {
-                showToast("Admin authorization failed! PIN required.", true);
+                showToast("Admin authorization failed! Password required.", true);
             }
         }
 
@@ -1541,7 +1678,7 @@ HTML_TEMPLATE = """
                 showToast("Job closed by Admin");
                 fetchAllData();
             } else {
-                showToast("Admin authorization failed! PIN required.", true);
+                showToast("Admin authorization failed! Password required.", true);
             }
         }
 
@@ -1585,7 +1722,6 @@ HTML_TEMPLATE = """
 def home():
     return render_template_string(HTML_TEMPLATE)
 
-# --- LABOURS: GET ALL ---
 @app.route("/api/labours", methods=["GET"])
 def get_labours():
     conn = get_db_connection()
@@ -1595,19 +1731,14 @@ def get_labours():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
-# --- LABOURS: REGISTER WITH ONE-NUMBER VALIDATION ---
 @app.route("/api/labours", methods=["POST"])
 def add_labour():
     data = request.get_json()
     phone = data.get("phone", "").strip()
-    
-    # Normalize phone: remove spaces, dashes
     clean_phone = re.sub(r'[^0-9+]', '', phone)
     
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Check if number already registered
     cursor.execute("SELECT id, name FROM labours WHERE phone = ? OR phone LIKE ?", (clean_phone, f"%{clean_phone[-10:]}%"))
     existing = cursor.fetchone()
     if existing:
@@ -1632,7 +1763,6 @@ def add_labour():
     conn.close()
     return jsonify({"id": new_id, "message": "Labour registered successfully"}), 201
 
-# --- LABOURS: ASSIGN TO CONTRACTOR / RELEASE ---
 @app.route("/api/labours/<int:id>/assign", methods=["PATCH"])
 def assign_labour(id):
     data = request.get_json()
@@ -1651,12 +1781,11 @@ def assign_labour(id):
     conn.close()
     return jsonify({"message": "Worker assignment updated"}), 200
 
-# --- LABOURS: ADMIN-ONLY DELETE ---
 @app.route("/api/labours/<int:id>", methods=["DELETE"])
 def delete_labour(id):
     admin_pin = request.headers.get("X-Admin-PIN")
     if admin_pin != ADMIN_PIN:
-        return jsonify({"error": "Unauthorized. Admin PIN required."}), 403
+        return jsonify({"error": "Unauthorized. Admin Password required."}), 403
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1665,7 +1794,6 @@ def delete_labour(id):
     conn.close()
     return jsonify({"message": f"Labour {id} deleted by Admin"}), 200
 
-# --- JOBS: GET ALL ---
 @app.route("/api/jobs", methods=["GET"])
 def get_jobs():
     conn = get_db_connection()
@@ -1675,7 +1803,6 @@ def get_jobs():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
-# --- JOBS: POST WITH PHOTO ---
 @app.route("/api/jobs", methods=["POST"])
 def add_job():
     data = request.get_json()
@@ -1699,12 +1826,11 @@ def add_job():
     conn.close()
     return jsonify({"id": new_id, "message": "Job requirement created"}), 201
 
-# --- JOBS: ADMIN-ONLY DELETE ---
 @app.route("/api/jobs/<int:id>", methods=["DELETE"])
 def delete_job(id):
     admin_pin = request.headers.get("X-Admin-PIN")
     if admin_pin != ADMIN_PIN:
-        return jsonify({"error": "Unauthorized. Admin PIN required."}), 403
+        return jsonify({"error": "Unauthorized. Admin Password required."}), 403
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1713,7 +1839,6 @@ def delete_job(id):
     conn.close()
     return jsonify({"message": f"Job {id} closed by Admin"}), 200
 
-# --- BACKUP: DOWNLOAD JSON SNAPSHOT ---
 @app.route("/api/backup", methods=["GET"])
 def backup_database():
     conn = get_db_connection()
@@ -1726,7 +1851,7 @@ def backup_database():
 
     backup_data = {
         "app": "ShramikLink",
-        "version": "3.0-enterprise",
+        "version": "4.0-enterprise",
         "exported_at": datetime.utcnow().isoformat() + "Z",
         "total_labours": len(labours),
         "total_jobs": len(jobs),
@@ -1740,7 +1865,6 @@ def backup_database():
         headers={"Content-Disposition": f"attachment;filename=shramiklink_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"}
     )
 
-# --- RESTORE: RESTORE FROM JSON SNAPSHOT ---
 @app.route("/api/restore", methods=["POST"])
 def restore_database():
     data = request.get_json()
