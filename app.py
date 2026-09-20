@@ -1,1897 +1,2938 @@
-from flask import Flask, jsonify, render_template_string, request, Response
-from flask_cors import CORS
+
+import os
 import sqlite3
 import json
-import os
-import re
+import base64
+from flask import Flask, request, jsonify, send_file, g
+from flask_cors import CORS
+from io import BytesIO
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
 DB_NAME = "labour_portal.db"
-ADMIN_PIN = "9999"  # Admin security password
+ADMIN_PIN = "9999"
 
-# ─────────────────────────────────────────────────────────────
-# 1. DATABASE SETUP & AUTOMATIC SCHEMA MIGRATION
-# ─────────────────────────────────────────────────────────────
-def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ─────────────────────────────────────────────
+# DATABASE SETUP
+# ─────────────────────────────────────────────
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DB_NAME)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # Core tables
+    c.execute("""
         CREATE TABLE IF NOT EXISTS labours (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            phone TEXT NOT NULL UNIQUE,
-            location TEXT NOT NULL,
-            skill TEXT NOT NULL,
-            experience TEXT NOT NULL,
-            daily_wage TEXT NOT NULL,
+            phone TEXT UNIQUE NOT NULL,
+            location TEXT,
+            skill TEXT,
+            experience TEXT,
+            daily_wage TEXT,
             status TEXT DEFAULT 'Available',
             assigned_contractor TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
 
-    cursor.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS contractor_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            contractor_name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            location TEXT NOT NULL,
-            work_type TEXT NOT NULL,
-            workers_needed INTEGER NOT NULL,
-            wage_offered TEXT NOT NULL,
-            requirements TEXT NOT NULL,
+            contractor_name TEXT,
+            phone TEXT,
+            location TEXT,
+            work_type TEXT,
+            workers_needed INTEGER,
+            wage_offered TEXT,
+            requirements TEXT,
             photo_data TEXT DEFAULT '',
             status TEXT DEFAULT 'Open',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
 
-    # Schema migration safety
-    cursor.execute("PRAGMA table_info(labours)")
-    labour_cols = [c[1] for c in cursor.fetchall()]
-    if "assigned_contractor" not in labour_cols:
-        cursor.execute("ALTER TABLE labours ADD COLUMN assigned_contractor TEXT DEFAULT ''")
+    # Schema migrations (safe ALTER TABLE)
+    existing_cols = [r[1] for r in c.execute("PRAGMA table_info(labours)").fetchall()]
+    if 'assigned_contractor' not in existing_cols:
+        c.execute("ALTER TABLE labours ADD COLUMN assigned_contractor TEXT DEFAULT ''")
+    if 'status' not in existing_cols:
+        c.execute("ALTER TABLE labours ADD COLUMN status TEXT DEFAULT 'Available'")
 
-    cursor.execute("PRAGMA table_info(contractor_jobs)")
-    job_cols = [c[1] for c in cursor.fetchall()]
-    if "photo_data" not in job_cols:
-        cursor.execute("ALTER TABLE contractor_jobs ADD COLUMN photo_data TEXT DEFAULT ''")
+    job_cols = [r[1] for r in c.execute("PRAGMA table_info(contractor_jobs)").fetchall()]
+    if 'photo_data' not in job_cols:
+        c.execute("ALTER TABLE contractor_jobs ADD COLUMN photo_data TEXT DEFAULT ''")
+    if 'status' not in job_cols:
+        c.execute("ALTER TABLE contractor_jobs ADD COLUMN status TEXT DEFAULT 'Open'")
 
-    # Seed demo data if database is empty
-    cursor.execute("SELECT COUNT(*) FROM labours")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany("""
-            INSERT INTO labours (name, phone, location, skill, experience, daily_wage, status, assigned_contractor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            ("Ramesh Kumar (రమేష్)", "+91 98765 43210", "Hyderabad, Gachibowli", "Mason (Mistri)", "8 Years", "₹850 / day", "Busy", "Apex Infra Builders"),
-            ("Sunil Verma (सुनील)", "+91 98123 45678", "Delhi NCR, Noida", "Electrician", "5 Years", "₹750 / day", "Available", ""),
-            ("Mohammad Arif", "+91 97234 56789", "Bengaluru, Whitefield", "Plumber", "6 Years", "₹800 / day", "Available", ""),
-            ("Suresh Reddy (సురేష్)", "+91 99123 44556", "Visakhapatnam, Madhurawada", "Tile & Marble", "7 Years", "₹900 / day", "Available", ""),
-            ("Vikram Singh (विक्रम)", "+91 96345 67890", "Pune, Hinjewadi", "Painter", "4 Years", "₹650 / day", "Available", ""),
-            ("Santosh Yadav", "+91 94567 89012", "Lucknow, Gomti Nagar", "General Helper", "2 Years", "₹500 / day", "Available", "")
-        ])
+    # New v5 tables
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS job_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
+            worker_name TEXT,
+            worker_phone TEXT,
+            status TEXT DEFAULT 'Pending',
+            applied_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(job_id) REFERENCES contractor_jobs(id),
+            FOREIGN KEY(worker_id) REFERENCES labours(id)
+        )
+    """)
 
-    cursor.execute("SELECT COUNT(*) FROM contractor_jobs")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany("""
-            INSERT INTO contractor_jobs (contractor_name, phone, location, work_type, workers_needed, wage_offered, requirements, photo_data, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            ("Apex Infra Builders", "+91 99887 76655", "Hyderabad, Hitec City", "Masonry & RCC Slab", 6, "₹900 / day", "Need 6 experienced masons for high-rise commercial slab work. On-site accommodation and meals provided.", "", "Open"),
-            ("Home Renovation - Amit", "+91 98776 65544", "Delhi, Dwarka Sector 12", "Bathroom Tile Leakage Repair", 2, "₹850 / day", "Tile leakage in 2 bathrooms. Need master plumber and tile fitter. Immediate work.", "", "Open")
-        ])
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS worker_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL,
+            reviewer_name TEXT,
+            rating INTEGER,
+            comment TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(worker_id) REFERENCES labours(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL,
+            amount REAL,
+            type TEXT,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(worker_id) REFERENCES labours(id)
+        )
+    """)
+
+    # Seed data
+    count = c.execute("SELECT COUNT(*) FROM labours").fetchone()[0]
+    if count == 0:
+        seed = [
+            ("రాజు కుమార్", "9876543210", "Hyderabad", "Mason", "5 years", "700"),
+            ("सुरेश यादव", "9123456789", "Mumbai", "Electrician", "3 years", "800"),
+            ("Ramesh Kumar", "9988776655", "Bangalore", "Plumber", "7 years", "750"),
+            ("అర్జున్ రెడ్డి", "9871234560", "Hyderabad", "Painter", "4 years", "600"),
+            ("Priya Singh", "9765432100", "Delhi", "Carpenter", "6 years", "850"),
+            ("మహేష్ బాబు", "9654321098", "Vijayawada", "Welder", "8 years", "900"),
+        ]
+        for s in seed:
+            try:
+                c.execute("""INSERT INTO labours (name,phone,location,skill,experience,daily_wage)
+                             VALUES (?,?,?,?,?,?)""", s)
+            except:
+                pass
 
     conn.commit()
     conn.close()
 
 init_db()
 
-# ─────────────────────────────────────────────────────────────
-# 2. FRONTEND APPLICATION WITH ROLE-BASED ENTRY GATE
-# ─────────────────────────────────────────────────────────────
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+# ─────────────────────────────────────────────
+# HTML TEMPLATE  (v5.0 — Startup Redesign)
+# ─────────────────────────────────────────────
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>ShramikLink | National Labour & Contractor Network</title>
-    <meta name="theme-color" content="#070a12">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root {
-            --bg-main: #070a12;
-            --bg-card: rgba(15, 23, 42, 0.85);
-            --bg-card-hover: rgba(22, 34, 61, 0.95);
-            --accent-gold: #f59e0b;
-            --accent-gold-dark: #d97706;
-            --accent-blue: #38bdf8;
-            --whatsapp-green: #25D366;
-            --whatsapp-dark: #128C7E;
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --border-color: rgba(51, 65, 85, 0.6);
-            --success: #10b981;
-            --danger: #ef4444;
-            --busy-orange: #fb923c;
-        }
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>ShramikLink — Work. Connect. Grow.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Noto+Sans+Devanagari:wght@400;600;700&family=Noto+Sans+Telugu:wght@400;600;700&display=swap" rel="stylesheet"/>
+<style>
+/* ══════════════════════════════════════════
+   DESIGN TOKENS
+══════════════════════════════════════════ */
+:root {
+  --brand-primary: #f97316;
+  --brand-dark:    #c2410c;
+  --brand-light:   #fff7ed;
+  --brand-accent:  #0ea5e9;
+  --success:       #22c55e;
+  --error:         #ef4444;
+  --warn:          #eab308;
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", sans-serif; }
-        body { background-color: var(--bg-main); color: var(--text-primary); min-height: 100vh; display: flex; flex-direction: column; }
+  --bg-page:       #f8fafc;
+  --bg-card:       #ffffff;
+  --bg-dark:       #0f172a;
 
-        /* ─────────────────────────────────────────────────────────────
-           FULL-SCREEN ENTRY GATE (USER VS ADMIN SELECTION)
-        ───────────────────────────────────────────────────────────── */
-        #roleGateOverlay {
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: linear-gradient(180deg, rgba(7, 10, 18, 0.94) 0%, rgba(11, 17, 32, 0.98) 100%),
-                        url('https://images.unsplash.com/photo-1541888946425-d0fbb186156a?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
-            z-index: 20000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .gate-card {
-            background: rgba(15, 23, 42, 0.95);
-            backdrop-filter: blur(20px);
-            border: 1px solid var(--border-color);
-            border-radius: 20px;
-            max-width: 520px;
-            width: 100%;
-            padding: 40px 30px;
-            text-align: center;
-            box-shadow: 0 25px 60px rgba(0,0,0,0.8);
-        }
-        .gate-icon {
-            width: 64px;
-            height: 64px;
-            background: linear-gradient(135deg, var(--accent-gold), #b45309);
-            color: #000;
-            border-radius: 16px;
-            font-size: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 16px auto;
-            box-shadow: 0 8px 25px rgba(245, 158, 11, 0.4);
-        }
-        .gate-title { font-size: 26px; font-weight: 900; margin-bottom: 6px; }
-        .gate-title span { color: var(--accent-gold); }
-        .gate-subtitle { font-size: 14px; color: var(--text-secondary); margin-bottom: 30px; }
-        
-        .role-options {
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-        .role-btn {
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 20px;
-            cursor: pointer;
-            text-align: left;
-            display: flex;
-            align-items: center;
-            gap: 18px;
-            transition: all 0.2s;
-        }
-        .role-btn:hover {
-            border-color: var(--accent-gold);
-            transform: translateY(-2px);
-            background: #111a2e;
-        }
-        .role-icon-box {
-            width: 48px;
-            height: 48px;
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 22px;
-            flex-shrink: 0;
-        }
-        .role-info h3 { font-size: 17px; color: #fff; margin-bottom: 4px; }
-        .role-info p { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
+  --text-primary:  #0f172a;
+  --text-secondary:#475569;
+  --text-muted:    #94a3b8;
+  --text-white:    #ffffff;
 
-        /* ADMIN PASSWORD MODAL / FORM */
-        #adminPinView {
-            display: none;
-            margin-top: 20px;
-            padding-top: 20px;
-            border-top: 1px solid var(--border-color);
-            text-align: center;
-        }
-        .pin-mask-input {
-            width: 180px;
-            letter-spacing: 12px;
-            font-size: 28px;
-            text-align: center;
-            padding: 12px;
-            background: #070a12;
-            border: 2px solid var(--accent-gold);
-            border-radius: 10px;
-            color: #fff;
-            margin-bottom: 16px;
-        }
-        .pin-mask-input:focus { outline: none; box-shadow: 0 0 15px rgba(245, 158, 11, 0.4); }
+  --border:        #e2e8f0;
+  --border-focus:  #f97316;
 
-        /* ─────────────────────────────────────────────────────────────
-           MAIN PORTAL STYLING
-        ───────────────────────────────────────────────────────────── */
-        .top-announcement {
-            background: linear-gradient(90deg, #1e1b4b, #312e81, #1e1b4b);
-            border-bottom: 1px solid rgba(99, 102, 241, 0.3);
-            font-size: 12px;
-            padding: 8px 16px;
-            color: #c7d2fe;
-            text-align: center;
-            font-weight: 500;
-        }
-        .top-announcement span { color: var(--accent-gold); font-weight: 700; }
+  --radius-sm:     8px;
+  --radius-md:     12px;
+  --radius-lg:     16px;
+  --radius-xl:     24px;
+  --radius-full:   9999px;
 
-        header {
-            background: rgba(7, 10, 18, 0.94);
-            backdrop-filter: blur(16px);
-            border-bottom: 1px solid var(--border-color);
-            position: sticky;
-            top: 0;
-            z-index: 1000;
-            padding: 12px 20px;
-        }
-        .nav-container {
-            max-width: 1200px;
-            margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            text-decoration: none;
-            color: var(--text-primary);
-        }
-        .brand-icon {
-            background: linear-gradient(135deg, var(--accent-gold), #b45309);
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 22px;
-            color: #000;
-            box-shadow: 0 4px 15px rgba(245, 158, 11, 0.35);
-        }
-        .brand-text h2 { font-size: 20px; font-weight: 900; letter-spacing: -0.5px; }
-        .brand-text h2 span { color: var(--accent-gold); }
-        .brand-tagline { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px; }
+  --shadow-sm:     0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+  --shadow-md:     0 4px 16px rgba(0,0,0,.10);
+  --shadow-lg:     0 10px 40px rgba(0,0,0,.14);
+  --shadow-brand:  0 8px 24px rgba(249,115,22,.30);
 
-        .nav-actions { display: flex; align-items: center; gap: 12px; }
+  --nav-h:         64px;
+  --bottom-nav-h:  68px;
+  --font-main:     'Inter', 'Noto Sans Devanagari', 'Noto Sans Telugu', sans-serif;
+}
 
-        .lang-switch {
-            display: flex;
-            background: rgba(30, 41, 59, 0.7);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 2px;
-        }
-        .lang-btn {
-            background: transparent;
-            border: none;
-            color: var(--text-secondary);
-            padding: 6px 12px;
-            font-size: 12px;
-            font-weight: 700;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .lang-btn.active {
-            background: var(--accent-gold);
-            color: #000;
-            box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
-        }
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html { scroll-behavior:smooth; }
+body {
+  font-family: var(--font-main);
+  background: var(--bg-page);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
 
-        .admin-badge {
-            display: none;
-            align-items: center;
-            gap: 6px;
-            font-size: 11px;
-            background: rgba(239, 68, 68, 0.15);
-            color: #f87171;
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-weight: 700;
-        }
+/* ══════════════════════════════════════════
+   ENTRY GATE OVERLAY
+══════════════════════════════════════════ */
+#roleGateOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  transition: opacity .5s ease;
+}
+#roleGateOverlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+.gate-card {
+  background: rgba(255,255,255,.06);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: var(--radius-xl);
+  padding: 40px 32px;
+  max-width: 420px;
+  width: 90%;
+  text-align: center;
+  animation: gateIn .6s ease;
+}
+@keyframes gateIn {
+  from { opacity:0; transform:translateY(30px) scale(.96); }
+  to   { opacity:1; transform:translateY(0) scale(1); }
+}
+.gate-logo {
+  font-size: 2.2rem;
+  font-weight: 900;
+  color: #fff;
+  letter-spacing: -1px;
+  margin-bottom: 4px;
+}
+.gate-logo span { color: var(--brand-primary); }
+.gate-tagline {
+  font-size: .875rem;
+  color: rgba(255,255,255,.6);
+  margin-bottom: 36px;
+}
+.gate-title {
+  font-size: 1.1rem;
+  color: rgba(255,255,255,.85);
+  font-weight: 600;
+  margin-bottom: 24px;
+}
+.gate-btns { display: flex; flex-direction: column; gap: 12px; }
+.gate-btn {
+  padding: 16px 24px;
+  border-radius: var(--radius-lg);
+  border: none;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all .2s;
+  font-family: var(--font-main);
+}
+.gate-btn-user {
+  background: var(--brand-primary);
+  color: #fff;
+  box-shadow: var(--shadow-brand);
+}
+.gate-btn-user:hover { background: var(--brand-dark); transform: translateY(-2px); }
+.gate-btn-admin {
+  background: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.9);
+  border: 1px solid rgba(255,255,255,.2);
+}
+.gate-btn-admin:hover { background: rgba(255,255,255,.18); transform: translateY(-2px); }
+#adminPinSection { display: none; margin-top: 20px; }
+#adminPinSection.visible { display: block; }
+.pin-dots {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  margin: 16px 0 20px;
+}
+.pin-dot {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.5);
+  background: transparent;
+  transition: all .2s;
+}
+.pin-dot.filled { background: var(--brand-primary); border-color: var(--brand-primary); }
+.pin-keypad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  max-width: 240px;
+  margin: 0 auto 16px;
+}
+.pin-key {
+  padding: 14px;
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.15);
+  border-radius: var(--radius-md);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .15s;
+  font-family: var(--font-main);
+}
+.pin-key:hover { background: rgba(255,255,255,.22); transform: scale(1.04); }
+.pin-key:active { transform: scale(.96); }
+.pin-error {
+  color: #fca5a5;
+  font-size: .85rem;
+  min-height: 20px;
+  margin-bottom: 8px;
+}
+.pin-back { grid-column: 3; }
 
-        .hero {
-            position: relative;
-            background: linear-gradient(180deg, rgba(7, 10, 18, 0.88) 0%, rgba(11, 17, 32, 0.97) 100%),
-                        url('https://images.unsplash.com/photo-1541888946425-d0fbb186156a?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
-            padding: 55px 20px 40px 20px;
-            text-align: center;
-            border-bottom: 1px solid var(--border-color);
-        }
-        .hero-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            background: rgba(245, 158, 11, 0.15);
-            color: var(--accent-gold);
-            border: 1px solid rgba(245, 158, 11, 0.35);
-            padding: 6px 16px;
-            border-radius: 30px;
-            font-size: 13px;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }
-        .hero h1 {
-            font-size: 38px;
-            font-weight: 900;
-            line-height: 1.2;
-            margin-bottom: 12px;
-            background: linear-gradient(135deg, #ffffff 30%, #94a3b8 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .hero p {
-            font-size: 15px;
-            color: #cbd5e1;
-            max-width: 680px;
-            margin: 0 auto 24px auto;
-            line-height: 1.6;
-        }
+/* ══════════════════════════════════════════
+   TOP NAVIGATION
+══════════════════════════════════════════ */
+#topNav {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 1000;
+  height: var(--nav-h);
+  background: rgba(255,255,255,.9);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 24px;
+  gap: 16px;
+}
+.nav-logo {
+  font-size: 1.4rem;
+  font-weight: 900;
+  color: var(--text-primary);
+  letter-spacing: -1px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.nav-logo span { color: var(--brand-primary); }
+.nav-links {
+  display: flex;
+  gap: 4px;
+  margin-left: 20px;
+}
+.nav-link {
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: .875rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border: none;
+  background: none;
+  transition: all .2s;
+  font-family: var(--font-main);
+}
+.nav-link:hover, .nav-link.active { color: var(--brand-primary); background: var(--brand-light); }
+.nav-spacer { flex: 1; }
+.nav-lang {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-page);
+  border-radius: var(--radius-full);
+  padding: 4px;
+}
+.lang-btn {
+  padding: 5px 12px;
+  border-radius: var(--radius-full);
+  border: none;
+  background: none;
+  font-size: .8rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all .2s;
+  font-family: var(--font-main);
+}
+.lang-btn.active { background: var(--brand-primary); color: #fff; }
+.nav-cta {
+  padding: 9px 20px;
+  background: var(--brand-primary);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-full);
+  font-size: .875rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all .2s;
+  font-family: var(--font-main);
+}
+.nav-cta:hover { background: var(--brand-dark); transform: translateY(-1px); }
 
-        .stats-strip {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 14px;
-            max-width: 850px;
-            margin: 0 auto;
-        }
-        .stat-box {
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(10px);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 14px;
-        }
-        .stat-num { font-size: 26px; font-weight: 900; color: var(--accent-gold); }
-        .stat-txt { font-size: 12px; color: var(--text-secondary); margin-top: 4px; font-weight: 600; }
+/* Mobile nav burger */
+.nav-burger { display: none; flex-direction: column; gap: 5px; cursor: pointer; padding: 8px; }
+.nav-burger span { display: block; width: 22px; height: 2px; background: var(--text-primary); border-radius: 2px; transition: .3s; }
+@media(max-width:768px) {
+  .nav-links, .nav-lang, .nav-cta { display: none; }
+  .nav-burger { display: flex; }
+  .nav-logo { font-size: 1.2rem; }
+}
 
-        .tabs-bar {
-            max-width: 1200px;
-            margin: 20px auto 16px auto;
-            padding: 0 20px;
-            display: flex;
-            gap: 8px;
-            overflow-x: auto;
-            scrollbar-width: none;
-        }
-        .tabs-bar::-webkit-scrollbar { display: none; }
-        .tab-btn {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            padding: 12px 18px;
-            border-radius: 10px;
-            font-weight: 700;
-            font-size: 14px;
-            cursor: pointer;
-            white-space: nowrap;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            transition: all 0.2s;
-        }
-        .tab-btn.active {
-            background: var(--accent-gold);
-            color: #000;
-            border-color: var(--accent-gold);
-            box-shadow: 0 4px 18px rgba(245, 158, 11, 0.3);
-        }
+/* ══════════════════════════════════════════
+   MOBILE BOTTOM NAVIGATION
+══════════════════════════════════════════ */
+#bottomNav {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: var(--bottom-nav-h);
+  background: #fff;
+  border-top: 1px solid var(--border);
+  z-index: 999;
+  padding: 0 8px 8px;
+  align-items: center;
+}
+@media(max-width:768px) { #bottomNav { display: flex; } }
+.bottom-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 6px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: .65rem;
+  font-weight: 500;
+  transition: all .2s;
+  font-family: var(--font-main);
+}
+.bottom-nav-item.active { color: var(--brand-primary); }
+.bottom-nav-item svg { width: 22px; height: 22px; }
+.bnav-post {
+  background: var(--brand-primary) !important;
+  color: #fff !important;
+  border-radius: 14px !important;
+  padding: 10px 4px !important;
+  box-shadow: var(--shadow-brand);
+}
 
-        /* ADMIN TAB: HIDDEN FOR USERS BY DEFAULT */
-        #btn-backup { display: none; }
+/* ══════════════════════════════════════════
+   PAGE LAYOUT
+══════════════════════════════════════════ */
+#appContent {
+  padding-top: var(--nav-h);
+  min-height: 100vh;
+}
+@media(max-width:768px) { #appContent { padding-bottom: var(--bottom-nav-h); } }
 
-        main {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 20px;
-            flex: 1;
-            width: 100%;
-        }
+.page { display: none; }
+.page.active { display: block; }
 
-        .filter-bar {
-            display: flex;
-            gap: 12px;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
-        }
-        .search-input {
-            flex: 2;
-            min-width: 250px;
-            padding: 14px 18px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 14px;
-        }
-        .search-input:focus { outline: 2px solid var(--accent-gold); }
-        .filter-select {
-            flex: 1;
-            min-width: 180px;
-            padding: 14px 18px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 14px;
-        }
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+@media(max-width:640px) { .container { padding: 0 16px; } }
 
-        .items-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
-        }
-        .item-card {
-            background: var(--bg-card);
-            backdrop-filter: blur(10px);
-            border: 1px solid var(--border-color);
-            border-radius: 14px;
-            padding: 22px;
-            transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        }
-        .item-card:hover {
-            transform: translateY(-3px);
-            border-color: rgba(245, 158, 11, 0.5);
-            background: var(--bg-card-hover);
-            box-shadow: 0 12px 30px rgba(0,0,0,0.4);
-        }
-        .card-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 12px;
-        }
-        .card-title { font-size: 19px; font-weight: 800; color: #fff; }
-        
-        .card-badge {
-            font-size: 11px;
-            font-weight: 800;
-            padding: 5px 10px;
-            border-radius: 6px;
-            text-transform: uppercase;
-        }
-        .badge-available { background: rgba(16, 185, 129, 0.15); color: #34d399; }
-        .badge-busy { background: rgba(251, 146, 60, 0.18); color: var(--busy-orange); border: 1px solid rgba(251, 146, 60, 0.35); }
-        .badge-job { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+/* ══════════════════════════════════════════
+   HERO SECTION
+══════════════════════════════════════════ */
+.hero {
+  position: relative;
+  min-height: 540px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 60%, #0f172a 100%);
+}
+.hero-bg {
+  position: absolute;
+  inset: 0;
+  background-image: url('https://images.unsplash.com/photo-1504307651254-35680f356dfd?auto=format&fit=crop&w=1600&q=80');
+  background-size: cover;
+  background-position: center;
+  opacity: .22;
+}
+.hero-content {
+  position: relative;
+  z-index: 1;
+  padding: 80px 0;
+}
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(249,115,22,.18);
+  border: 1px solid rgba(249,115,22,.4);
+  color: #fdba74;
+  padding: 6px 16px;
+  border-radius: var(--radius-full);
+  font-size: .8rem;
+  font-weight: 600;
+  margin-bottom: 24px;
+}
+.hero-title {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 900;
+  color: #fff;
+  line-height: 1.15;
+  letter-spacing: -1px;
+  margin-bottom: 20px;
+}
+.hero-title span { color: var(--brand-primary); }
+.hero-sub {
+  font-size: clamp(.95rem, 2vw, 1.2rem);
+  color: rgba(255,255,255,.72);
+  max-width: 560px;
+  line-height: 1.65;
+  margin-bottom: 40px;
+}
+.hero-search {
+  display: flex;
+  gap: 10px;
+  max-width: 580px;
+  background: #fff;
+  border-radius: var(--radius-xl);
+  padding: 8px 8px 8px 20px;
+  box-shadow: var(--shadow-lg);
+}
+.hero-search input {
+  flex: 1;
+  border: none;
+  outline: none;
+  font-size: 1rem;
+  font-family: var(--font-main);
+  color: var(--text-primary);
+  background: none;
+}
+.hero-search input::placeholder { color: var(--text-muted); }
+.hero-search button {
+  padding: 12px 24px;
+  background: var(--brand-primary);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-lg);
+  font-size: .9rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: .2s;
+  white-space: nowrap;
+  font-family: var(--font-main);
+}
+.hero-search button:hover { background: var(--brand-dark); }
+.hero-stats {
+  display: flex;
+  gap: 40px;
+  margin-top: 48px;
+  flex-wrap: wrap;
+}
+.hero-stat { text-align: left; }
+.hero-stat-num {
+  font-size: 1.8rem;
+  font-weight: 800;
+  color: #fff;
+  line-height: 1;
+}
+.hero-stat-label {
+  font-size: .8rem;
+  color: rgba(255,255,255,.55);
+  margin-top: 3px;
+}
+@media(max-width:640px) {
+  .hero-search { flex-direction: column; padding: 12px; }
+  .hero-stats { gap: 24px; }
+}
 
-        .contractor-tag {
-            display: block;
-            background: rgba(251, 146, 60, 0.1);
-            color: #fed7aa;
-            padding: 6px 10px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            margin-bottom: 10px;
-            border-left: 3px solid var(--busy-orange);
-        }
+/* ══════════════════════════════════════════
+   SECTION COMMON
+══════════════════════════════════════════ */
+.section { padding: 64px 0; }
+.section-sm { padding: 40px 0; }
+.section-dark { background: var(--bg-dark); color: #fff; }
+.section-brand { background: linear-gradient(135deg, var(--brand-primary), var(--brand-dark)); color: #fff; }
 
-        .card-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 13px;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-        }
-        .card-row i { color: var(--accent-gold); width: 16px; text-align: center; }
+.section-header { text-align: center; margin-bottom: 48px; }
+.section-eyebrow {
+  font-size: .8rem;
+  font-weight: 700;
+  color: var(--brand-primary);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.section-title {
+  font-size: clamp(1.6rem, 3.5vw, 2.4rem);
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  margin-bottom: 14px;
+}
+.section-sub {
+  font-size: 1rem;
+  color: var(--text-secondary);
+  max-width: 520px;
+  margin: 0 auto;
+  line-height: 1.65;
+}
+.section-dark .section-sub { color: rgba(255,255,255,.6); }
 
-        .wage-tag {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            background: rgba(245, 158, 11, 0.12);
-            color: var(--accent-gold);
-            font-weight: 800;
-            font-size: 13px;
-            padding: 5px 10px;
-            border-radius: 6px;
-            margin: 6px 0 12px 0;
-            border: 1px solid rgba(245, 158, 11, 0.25);
-        }
+/* ══════════════════════════════════════════
+   CATEGORY CARDS (Home Page)
+══════════════════════════════════════════ */
+.category-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 16px;
+}
+.cat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: all .25s;
+  box-shadow: var(--shadow-sm);
+}
+.cat-card:hover {
+  border-color: var(--brand-primary);
+  box-shadow: var(--shadow-brand);
+  transform: translateY(-4px);
+}
+.cat-icon { font-size: 2.2rem; margin-bottom: 10px; }
+.cat-name { font-size: .9rem; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+.cat-count { font-size: .78rem; color: var(--text-muted); }
 
-        .job-photo-preview {
-            width: 100%;
-            height: 160px;
-            object-fit: cover;
-            border-radius: 8px;
-            margin: 10px 0;
-            border: 1px solid var(--border-color);
-            cursor: pointer;
-            transition: opacity 0.2s;
-        }
-        .job-photo-preview:hover { opacity: 0.9; }
+/* ══════════════════════════════════════════
+   HOW IT WORKS
+══════════════════════════════════════════ */
+.how-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 32px;
+}
+.how-step {
+  text-align: center;
+  padding: 32px 24px;
+  background: rgba(255,255,255,.05);
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(255,255,255,.1);
+}
+.how-num {
+  width: 52px; height: 52px;
+  background: var(--brand-primary);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.3rem;
+  font-weight: 800;
+  color: #fff;
+  margin: 0 auto 20px;
+}
+.how-step h3 { font-size: 1.05rem; font-weight: 700; color: #fff; margin-bottom: 10px; }
+.how-step p { font-size: .875rem; color: rgba(255,255,255,.6); line-height: 1.6; }
 
-        .btn-group {
-            display: flex;
-            gap: 8px;
-            border-top: 1px solid rgba(255,255,255,0.08);
-            padding-top: 14px;
-            margin-top: 12px;
-            flex-wrap: wrap;
-        }
-        .btn-call {
-            flex: 1;
-            min-width: 100px;
-            background: linear-gradient(135deg, #2563eb, #1d4ed8);
-            color: #fff;
-            text-decoration: none;
-            text-align: center;
-            padding: 10px;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 13px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
-        .btn-call:hover { background: #1e40af; }
-        
-        .btn-whatsapp {
-            flex: 1;
-            min-width: 110px;
-            background: linear-gradient(135deg, var(--whatsapp-green), var(--whatsapp-dark));
-            color: #fff;
-            text-decoration: none;
-            text-align: center;
-            padding: 10px;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 13px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
-        .btn-whatsapp:hover { opacity: 0.9; }
+/* ══════════════════════════════════════════
+   WORKER CARDS
+══════════════════════════════════════════ */
+.filters-bar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 28px;
+  align-items: center;
+}
+.filter-input {
+  flex: 1;
+  min-width: 200px;
+  padding: 11px 16px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: .9rem;
+  font-family: var(--font-main);
+  background: var(--bg-card);
+  transition: .2s;
+}
+.filter-input:focus { border-color: var(--border-focus); outline: none; box-shadow: 0 0 0 3px rgba(249,115,22,.12); }
+.filter-select {
+  padding: 11px 16px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: .9rem;
+  font-family: var(--font-main);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: .2s;
+}
+.filter-select:focus { border-color: var(--border-focus); outline: none; }
 
-        .btn-hire {
-            background: rgba(245, 158, 11, 0.15);
-            color: var(--accent-gold);
-            border: 1px solid rgba(245, 158, 11, 0.35);
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 12px;
-            font-weight: 700;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
-        .btn-hire:hover { background: rgba(245, 158, 11, 0.25); }
+.workers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 20px;
+}
 
-        .btn-release {
-            background: rgba(16, 185, 129, 0.15);
-            color: #34d399;
-            border: 1px solid rgba(16, 185, 129, 0.3);
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 12px;
-            font-weight: 700;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
+.worker-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  box-shadow: var(--shadow-sm);
+  transition: all .25s;
+  position: relative;
+  overflow: hidden;
+}
+.worker-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.worker-card-top { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+.worker-avatar {
+  width: 56px; height: 56px;
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-dark));
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  flex-shrink: 0;
+}
+.worker-info { flex: 1; }
+.worker-name { font-size: 1.05rem; font-weight: 700; color: var(--text-primary); margin-bottom: 4px; }
+.worker-skill {
+  display: inline-block;
+  background: var(--brand-light);
+  color: var(--brand-primary);
+  border-radius: var(--radius-full);
+  padding: 3px 10px;
+  font-size: .75rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.worker-loc { font-size: .82rem; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
+.worker-status-badge {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  font-size: .72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+}
+.status-available { background: #dcfce7; color: #15803d; }
+.status-busy { background: #fee2e2; color: #b91c1c; }
 
-        /* ADMIN DELETE BUTTONS: TOTALLY HIDDEN UNLESS ADMIN MODE IS ACTIVE */
-        .btn-admin-delete {
-            display: none;
-            background: rgba(239, 68, 68, 0.12);
-            color: #ef4444;
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            padding: 8px 12px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            width: 100%;
-            margin-top: 6px;
-            text-align: center;
-        }
-        body.is-admin .btn-admin-delete { display: block; }
-        body.is-admin .admin-badge { display: flex; }
-        body.is-admin #btn-backup { display: flex; }
+.worker-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 14px;
+  background: var(--bg-page);
+  border-radius: var(--radius-md);
+}
+.meta-item { }
+.meta-label { font-size: .72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+.meta-value { font-size: .9rem; font-weight: 600; color: var(--text-primary); }
 
-        .form-card {
-            background: var(--bg-card);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 30px;
-            max-width: 650px;
-            margin: 0 auto 50px auto;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
-        }
-        .form-title { font-size: 24px; margin-bottom: 6px; color: #fff; font-weight: 800; }
-        .form-desc { color: var(--text-secondary); font-size: 14px; margin-bottom: 24px; }
-        .form-group { margin-bottom: 18px; }
-        .form-label { display: block; font-size: 13px; font-weight: 700; margin-bottom: 8px; color: #e2e8f0; }
-        .form-input, .form-textarea, .form-select {
-            width: 100%;
-            padding: 14px;
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: #fff;
-            font-size: 14px;
-        }
-        .form-input:focus, .form-textarea:focus, .form-select:focus { outline: 2px solid var(--accent-gold); }
-        .btn-submit {
-            width: 100%;
-            padding: 16px;
-            background: linear-gradient(135deg, var(--accent-gold), var(--accent-gold-dark));
-            color: #000;
-            border: none;
-            border-radius: 10px;
-            font-weight: 900;
-            font-size: 16px;
-            cursor: pointer;
-            box-shadow: 0 4px 20px rgba(245, 158, 11, 0.35);
-            margin-top: 10px;
-        }
-        .btn-submit:hover { opacity: 0.95; }
+.busy-tag {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  font-size: .8rem;
+  color: #c2410c;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
-        .photo-preview-box {
-            display: none;
-            margin-top: 10px;
-            border-radius: 8px;
-            max-height: 200px;
-            overflow: hidden;
-            border: 1px solid var(--border-color);
-        }
-        .photo-preview-box img { width: 100%; height: 180px; object-fit: cover; }
+.worker-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+  padding: 9px 16px;
+  border-radius: var(--radius-md);
+  font-size: .85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: all .2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-main);
+  white-space: nowrap;
+}
+.btn-primary { background: var(--brand-primary); color: #fff; flex: 1; justify-content: center; }
+.btn-primary:hover { background: var(--brand-dark); }
+.btn-wa { background: #25d366; color: #fff; flex: 1; justify-content: center; }
+.btn-wa:hover { background: #128c3e; }
+.btn-outline { background: none; border: 1.5px solid var(--border); color: var(--text-secondary); }
+.btn-outline:hover { border-color: var(--brand-primary); color: var(--brand-primary); }
+.btn-danger { background: var(--error); color: #fff; }
+.btn-danger:hover { background: #dc2626; }
+.btn-success { background: var(--success); color: #fff; }
+.btn-success:hover { background: #16a34a; }
+.btn-sm { padding: 7px 12px; font-size: .8rem; }
+.btn-lg { padding: 14px 28px; font-size: 1rem; border-radius: var(--radius-lg); }
+.btn-full { width: 100%; justify-content: center; }
 
-        .backup-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 30px;
-            max-width: 750px;
-            margin: 0 auto 50px auto;
-        }
-        .backup-row {
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 18px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 16px;
-        }
+/* Admin-only elements */
+.admin-only { display: none; }
+body.is-admin .admin-only { display: inline-flex; }
 
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.8);
-            z-index: 5000;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .modal-content {
-            background: #131c2e;
-            border: 1px solid var(--border-color);
-            border-radius: 14px;
-            padding: 24px;
-            max-width: 480px;
-            width: 100%;
-            position: relative;
-        }
-        .modal-title { font-size: 20px; font-weight: 800; margin-bottom: 8px; color: #fff; }
-        .btn-modal-close {
-            position: absolute;
-            top: 16px;
-            right: 16px;
-            background: transparent;
-            border: none;
-            color: #94a3b8;
-            font-size: 18px;
-            cursor: pointer;
-        }
+/* ══════════════════════════════════════════
+   REGISTER WIZARD
+══════════════════════════════════════════ */
+.wizard-card {
+  max-width: 600px;
+  margin: 0 auto;
+  background: var(--bg-card);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.wizard-header {
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-dark));
+  padding: 32px 36px;
+  color: #fff;
+}
+.wizard-header h2 { font-size: 1.5rem; font-weight: 800; margin-bottom: 6px; }
+.wizard-header p { font-size: .875rem; opacity: .8; }
+.wizard-progress-bar {
+  height: 4px;
+  background: rgba(255,255,255,.25);
+  border-radius: 2px;
+  margin-top: 20px;
+  overflow: hidden;
+}
+.wizard-progress-fill {
+  height: 100%;
+  background: #fff;
+  border-radius: 2px;
+  transition: width .4s ease;
+}
+.wizard-steps-indicator {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+.ws-dot {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,.35);
+  flex: 1;
+  transition: .3s;
+}
+.ws-dot.active { background: #fff; }
 
-        .floating-whatsapp {
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            background: var(--whatsapp-green);
-            color: #fff;
-            width: 56px;
-            height: 56px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 30px;
-            box-shadow: 0 6px 25px rgba(37, 211, 102, 0.45);
-            z-index: 1000;
-            text-decoration: none;
-            transition: transform 0.2s;
-        }
-        .floating-whatsapp:hover { transform: scale(1.1); }
+.wizard-body { padding: 36px; }
+.wizard-step { display: none; }
+.wizard-step.active { display: block; }
 
-        footer {
-            background: #04070d;
-            border-top: 1px solid var(--border-color);
-            padding: 40px 20px 25px 20px;
-            margin-top: auto;
-            color: var(--text-secondary);
-            font-size: 13px;
-        }
-        .footer-container {
-            max-width: 1200px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 30px;
-            margin-bottom: 30px;
-        }
-        .footer-col h4 { color: #fff; margin-bottom: 14px; font-size: 15px; }
-        .footer-col ul { list-style: none; }
-        .footer-col li { margin-bottom: 8px; }
-        .footer-col a { color: var(--text-secondary); text-decoration: none; }
-        .footer-col a:hover { color: var(--accent-gold); }
-        .footer-bottom {
-            max-width: 1200px;
-            margin: 0 auto;
-            text-align: center;
-            border-top: 1px solid rgba(255,255,255,0.06);
-            padding-top: 20px;
-            font-size: 12px;
-        }
+.form-group { margin-bottom: 20px; }
+.form-label {
+  display: block;
+  font-size: .85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.form-input {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: .95rem;
+  font-family: var(--font-main);
+  transition: .2s;
+  background: var(--bg-page);
+}
+.form-input:focus { border-color: var(--border-focus); outline: none; box-shadow: 0 0 0 3px rgba(249,115,22,.12); background: #fff; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media(max-width:480px) { .form-row { grid-template-columns: 1fr; } }
 
-        #toast {
-            visibility: hidden;
-            min-width: 280px;
-            background: #10b981;
-            color: #fff;
-            text-align: center;
-            border-radius: 10px;
-            padding: 16px;
-            position: fixed;
-            z-index: 99999;
-            left: 50%;
-            bottom: 30px;
-            transform: translateX(-50%);
-            font-size: 14px;
-            font-weight: 700;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
-        }
-        #toast.show { visibility: visible; animation: fadein 0.3s, fadeout 0.3s 3.5s; }
-        @keyframes fadein { from { bottom: 0; opacity: 0; } to { bottom: 30px; opacity: 1; } }
-        @keyframes fadeout { from { bottom: 30px; opacity: 1; } to { bottom: 0; opacity: 0; } }
+.wizard-nav {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 28px;
+  gap: 12px;
+}
 
-        @media (max-width: 768px) {
-            .hero h1 { font-size: 26px; }
-            .hero { padding: 35px 16px 25px 16px; }
-            .items-grid { grid-template-columns: 1fr; }
-            .filter-bar { flex-direction: column; }
-        }
-    </style>
+/* ══════════════════════════════════════════
+   JOB CARDS
+══════════════════════════════════════════ */
+.jobs-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
+}
+.job-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  box-shadow: var(--shadow-sm);
+  transition: all .25s;
+  position: relative;
+}
+.job-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.job-header { margin-bottom: 16px; }
+.job-type-badge {
+  display: inline-block;
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-dark));
+  color: #fff;
+  border-radius: var(--radius-full);
+  padding: 4px 12px;
+  font-size: .75rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.job-title { font-size: 1.1rem; font-weight: 700; color: var(--text-primary); margin-bottom: 4px; }
+.job-meta-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 14px 0;
+}
+.job-meta-item {
+  background: var(--bg-page);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: .82rem;
+}
+.job-meta-item strong { display: block; color: var(--text-muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; font-weight: 600; }
+.job-photo { width: 100%; border-radius: var(--radius-md); margin: 12px 0; cursor: zoom-in; object-fit: cover; max-height: 180px; }
+.job-actions { display: flex; gap: 8px; margin-top: 14px; }
+
+/* ══════════════════════════════════════════
+   POST JOB FORM
+══════════════════════════════════════════ */
+.post-card {
+  max-width: 680px;
+  margin: 0 auto;
+  background: var(--bg-card);
+  border-radius: var(--radius-xl);
+  padding: 40px;
+  box-shadow: var(--shadow-lg);
+}
+@media(max-width:640px) { .post-card { padding: 24px; } }
+.photo-upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  text-align: center;
+  cursor: pointer;
+  transition: .2s;
+  margin-bottom: 20px;
+}
+.photo-upload-zone:hover { border-color: var(--brand-primary); background: var(--brand-light); }
+.photo-upload-zone.has-photo { border-style: solid; border-color: var(--success); }
+.upload-icon { font-size: 2rem; margin-bottom: 8px; }
+.upload-text { font-size: .875rem; color: var(--text-muted); }
+#photoPreview { max-width: 100%; border-radius: var(--radius-md); display: none; margin-top: 12px; }
+
+/* ══════════════════════════════════════════
+   TOAST NOTIFICATIONS
+══════════════════════════════════════════ */
+#toastContainer {
+  position: fixed;
+  top: 80px;
+  right: 20px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.toast {
+  min-width: 280px;
+  max-width: 380px;
+  padding: 14px 20px;
+  border-radius: var(--radius-md);
+  color: #fff;
+  font-size: .875rem;
+  font-weight: 500;
+  box-shadow: var(--shadow-lg);
+  animation: toastIn .3s ease;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+@keyframes toastIn {
+  from { opacity:0; transform:translateX(30px); }
+  to   { opacity:1; transform:translateX(0); }
+}
+.toast.success { background: #16a34a; }
+.toast.error   { background: var(--error); }
+.toast.info    { background: var(--brand-accent); }
+.toast.warn    { background: var(--warn); }
+
+/* ══════════════════════════════════════════
+   MODALS
+══════════════════════════════════════════ */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.55);
+  z-index: 5000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  backdrop-filter: blur(4px);
+}
+.modal-backdrop.hidden { display: none; }
+.modal {
+  background: var(--bg-card);
+  border-radius: var(--radius-xl);
+  padding: 32px;
+  max-width: 480px;
+  width: 100%;
+  box-shadow: var(--shadow-lg);
+  animation: modalIn .3s ease;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+@keyframes modalIn {
+  from { opacity:0; transform:scale(.94) translateY(20px); }
+  to   { opacity:1; transform:scale(1) translateY(0); }
+}
+.modal-title { font-size: 1.3rem; font-weight: 800; margin-bottom: 20px; }
+.modal-close {
+  float: right;
+  background: none;
+  border: none;
+  font-size: 1.4rem;
+  cursor: pointer;
+  color: var(--text-muted);
+  margin-top: -4px;
+}
+.modal-close:hover { color: var(--error); }
+
+/* ══════════════════════════════════════════
+   HIRE MODAL / ASSIGN CONTRACTOR
+══════════════════════════════════════════ */
+#hireModal, #reviewModal { }
+
+/* ══════════════════════════════════════════
+   LIGHTBOX
+══════════════════════════════════════════ */
+#lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.9);
+  z-index: 8000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+#lightbox.hidden { display: none; }
+#lightbox img { max-width: 100%; max-height: 90vh; border-radius: var(--radius-lg); }
+#lightboxClose {
+  position: absolute;
+  top: 20px; right: 24px;
+  color: #fff;
+  font-size: 2rem;
+  cursor: pointer;
+  background: none;
+  border: none;
+}
+
+/* ══════════════════════════════════════════
+   ADMIN PANEL PAGE
+══════════════════════════════════════════ */
+#adminPage { display: none; }
+body.is-admin #adminPage.active { display: block; }
+.admin-section-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  margin-bottom: 24px;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border);
+}
+.admin-section-card h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 16px; }
+
+/* ══════════════════════════════════════════
+   TRUST SECTION
+══════════════════════════════════════════ */
+.trust-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 24px;
+}
+.trust-item {
+  text-align: center;
+  padding: 28px 20px;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.trust-icon { font-size: 2rem; margin-bottom: 12px; }
+.trust-item h4 { font-size: .95rem; font-weight: 700; margin-bottom: 6px; }
+.trust-item p { font-size: .82rem; color: var(--text-muted); }
+
+/* ══════════════════════════════════════════
+   FOOTER
+══════════════════════════════════════════ */
+footer {
+  background: var(--bg-dark);
+  color: rgba(255,255,255,.6);
+  padding: 48px 0 32px;
+}
+.footer-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr;
+  gap: 40px;
+  margin-bottom: 40px;
+}
+@media(max-width:768px) { .footer-grid { grid-template-columns: 1fr 1fr; } }
+@media(max-width:480px) { .footer-grid { grid-template-columns: 1fr; } }
+.footer-brand-name { font-size: 1.3rem; font-weight: 900; color: #fff; margin-bottom: 10px; }
+.footer-brand-name span { color: var(--brand-primary); }
+.footer-desc { font-size: .85rem; line-height: 1.65; max-width: 280px; }
+.footer-col h4 { font-size: .9rem; font-weight: 700; color: #fff; margin-bottom: 16px; }
+.footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.footer-col ul li a { font-size: .83rem; color: rgba(255,255,255,.5); text-decoration: none; transition: .2s; }
+.footer-col ul li a:hover { color: var(--brand-primary); }
+.footer-bottom {
+  border-top: 1px solid rgba(255,255,255,.08);
+  padding-top: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: .8rem;
+}
+.footer-bottom a { color: var(--brand-primary); text-decoration: none; }
+
+/* ══════════════════════════════════════════
+   FLOATING WA BUTTON
+══════════════════════════════════════════ */
+.float-wa {
+  position: fixed;
+  bottom: calc(var(--bottom-nav-h) + 16px);
+  right: 20px;
+  z-index: 900;
+  width: 54px; height: 54px;
+  background: #25d366;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 20px rgba(37,211,102,.4);
+  text-decoration: none;
+  transition: .25s;
+  font-size: 1.6rem;
+}
+@media(min-width:769px) { .float-wa { bottom: 24px; } }
+.float-wa:hover { transform: scale(1.12); }
+
+/* ══════════════════════════════════════════
+   UTILITIES
+══════════════════════════════════════════ */
+.text-center { text-align: center; }
+.mt-8 { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mt-24 { margin-top: 24px; }
+.mb-8 { margin-bottom: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-muted);
+}
+.empty-state .empty-icon { font-size: 3.5rem; margin-bottom: 16px; }
+.empty-state p { font-size: 1rem; }
+.chip {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  font-size: .78rem;
+  font-weight: 600;
+}
+.chip-orange { background: var(--brand-light); color: var(--brand-primary); }
+.chip-blue { background: #e0f2fe; color: #0369a1; }
+.chip-green { background: #dcfce7; color: #15803d; }
+
+/* Page transitions */
+.page { animation: fadeIn .3s ease; }
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+
+/* Loading spinner */
+.spinner {
+  width: 40px; height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--brand-primary);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  margin: 40px auto;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Rating stars */
+.stars { color: var(--warn); font-size: 1.1rem; letter-spacing: 1px; }
+</style>
 </head>
 <body>
 
-    <!-- ─────────────────────────────────────────────────────────────
-         FULL SCREEN ENTRY GATE
-    ───────────────────────────────────────────────────────────── -->
-    <div id="roleGateOverlay">
-        <div class="gate-card">
-            <div class="gate-icon"><i class="fa-solid fa-helmet-safety"></i></div>
-            <h2 class="gate-title">Welcome to Shramik<span>Link</span></h2>
-            <p class="gate-subtitle">Please select your access profile to continue</p>
+<!-- ══════════════════════════════════════════
+     ENTRY GATE
+══════════════════════════════════════════ -->
+<div id="roleGateOverlay">
+  <div class="gate-card">
+    <div class="gate-logo">Shramik<span>Link</span></div>
+    <div class="gate-tagline">Work. Connect. Grow.</div>
 
-            <div class="role-options" id="roleSelectionView">
-                <!-- USER BUTTON: ENTERS DIRECTLY WITHOUT ASKING ANYTHING -->
-                <div class="role-btn" onclick="enterAsUser()">
-                    <div class="role-icon-box" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8;">
-                        <i class="fa-solid fa-users"></i>
-                    </div>
-                    <div class="role-info">
-                        <h3>I am a User / Public</h3>
-                        <p>Find skilled labours, post job requirements & direct WhatsApp / Call. (No password required)</p>
-                    </div>
-                </div>
-
-                <!-- ADMIN BUTTON: OPENS PASSWORD INPUT -->
-                <div class="role-btn" onclick="showAdminPinPrompt()">
-                    <div class="role-icon-box" style="background: rgba(245, 158, 11, 0.15); color: var(--accent-gold);">
-                        <i class="fa-solid fa-user-shield"></i>
-                    </div>
-                    <div class="role-info">
-                        <h3>I am an Admin</h3>
-                        <p>Authorized personnel management, profile deletion & database backup controls.</p>
-                    </div>
-                </div>
-            </div>
-
-            <!-- MASKED ADMIN PIN PROMPT (BULLET MASKED ••••) -->
-            <div id="adminPinView">
-                <h3 style="font-size: 18px; margin-bottom: 8px; color: #fff;"><i class="fa-solid fa-lock" style="color: var(--accent-gold);"></i> Enter Admin Security PIN</h3>
-                <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 16px;">Digits are masked with bullets for screen and keyboard privacy.</p>
-                
-                <input type="password" id="gateAdminPin" class="pin-mask-input" maxlength="4" placeholder="••••" autocomplete="off">
-                
-                <div style="display: flex; gap: 10px; justify-content: center;">
-                    <button class="tab-btn" onclick="cancelAdminLogin()"><i class="fa-solid fa-arrow-left"></i> Back</button>
-                    <button class="tab-btn active" onclick="submitAdminPin()"><i class="fa-solid fa-unlock"></i> Login as Admin</button>
-                </div>
-            </div>
-        </div>
+    <div id="gateRoleSection">
+      <div class="gate-title">Who are you?</div>
+      <div class="gate-btns">
+        <button class="gate-btn gate-btn-user" onclick="enterAsUser()">
+          👷 I am a User / Public
+        </button>
+        <button class="gate-btn gate-btn-admin" onclick="showAdminPinEntry()">
+          🔐 I am an Admin
+        </button>
+      </div>
     </div>
 
-    <!-- ANNOUNCEMENT BAR -->
-    <div class="top-announcement">
-        <i class="fa-solid fa-bolt" style="color: var(--accent-gold);"></i> 
-        <span id="txt-announcement">National Direct Labour & Contractor Network • 0% Brokerage • 100% Free Direct Calling</span>
+    <div id="adminPinSection">
+      <div class="gate-title" style="color:rgba(255,255,255,.85)">Enter Admin PIN</div>
+      <div class="pin-dots" id="pinDots">
+        <div class="pin-dot" id="dot0"></div>
+        <div class="pin-dot" id="dot1"></div>
+        <div class="pin-dot" id="dot2"></div>
+        <div class="pin-dot" id="dot3"></div>
+      </div>
+      <div class="pin-keypad" id="pinKeypad">
+        <button class="pin-key" onclick="pinPress('1')">1</button>
+        <button class="pin-key" onclick="pinPress('2')">2</button>
+        <button class="pin-key" onclick="pinPress('3')">3</button>
+        <button class="pin-key" onclick="pinPress('4')">4</button>
+        <button class="pin-key" onclick="pinPress('5')">5</button>
+        <button class="pin-key" onclick="pinPress('6')">6</button>
+        <button class="pin-key" onclick="pinPress('7')">7</button>
+        <button class="pin-key" onclick="pinPress('8')">8</button>
+        <button class="pin-key" onclick="pinPress('9')">9</button>
+        <button class="pin-key" onclick="pinClear()" style="font-size:.85rem">CLR</button>
+        <button class="pin-key" onclick="pinPress('0')">0</button>
+        <button class="pin-key pin-back" onclick="pinBackspace()">⌫</button>
+      </div>
+      <div class="pin-error" id="pinError"></div>
+      <button class="gate-btn gate-btn-admin" style="width:100%;font-size:.85rem" onclick="showRoleSection()">← Back</button>
     </div>
+  </div>
+</div>
 
-    <!-- MAIN NAVBAR -->
-    <header>
-        <div class="nav-container">
-            <a href="#" class="brand" onclick="switchTab('tab-labours')">
-                <div class="brand-icon"><i class="fa-solid fa-helmet-safety"></i></div>
-                <div class="brand-text">
-                    <h2>Shramik<span>Link</span></h2>
-                    <div class="brand-tagline" id="txt-tagline">National Workforce Portal</div>
-                </div>
-            </a>
-            
-            <div class="nav-actions">
-                <div class="admin-badge"><i class="fa-solid fa-user-shield"></i> Admin Logged In</div>
-                <div class="lang-switch">
-                    <button class="lang-btn active" id="lang-en" onclick="setLanguage('en')">EN</button>
-                    <button class="lang-btn" id="lang-hi" onclick="setLanguage('hi')">हिन्दी</button>
-                    <button class="lang-btn" id="lang-te" onclick="setLanguage('te')">తెలుగు</button>
-                </div>
-            </div>
-        </div>
-    </header>
+<!-- ══════════════════════════════════════════
+     TOAST CONTAINER
+══════════════════════════════════════════ -->
+<div id="toastContainer"></div>
 
-    <!-- HERO SECTION -->
-    <div class="hero">
-        <div class="hero-badge">
-            <i class="fa-solid fa-shield-check"></i> <span id="txt-verifiedBadge">Verified Workers & Contractors</span>
-        </div>
-        <h1 id="txt-heroTitle">Connect Skilled Labours & Contractors</h1>
-        <p id="txt-heroSub">Direct hiring without middlemen. Masons, Electricians, Plumbers, Painters & Helpers ready for immediate project onboarding.</p>
-        
-        <div class="stats-strip">
-            <div class="stat-box">
-                <div class="stat-num" id="count-labours">-</div>
-                <div class="stat-txt" id="txt-statWorkers">Verified Workers</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" id="count-jobs">-</div>
-                <div class="stat-txt" id="txt-statJobs">Active Site Jobs</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" style="color: #25D366;"><i class="fa-brands fa-whatsapp"></i> Instant</div>
-                <div class="stat-txt" id="txt-statWhatsapp">WhatsApp Contact</div>
-            </div>
-        </div>
+<!-- ══════════════════════════════════════════
+     LIGHTBOX
+══════════════════════════════════════════ -->
+<div id="lightbox" class="hidden">
+  <button id="lightboxClose" onclick="closeLightbox()">✕</button>
+  <img id="lightboxImg" src="" alt=""/>
+</div>
+
+<!-- ══════════════════════════════════════════
+     HIRE / ASSIGN MODAL
+══════════════════════════════════════════ -->
+<div id="hireModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" onclick="closeHireModal()">✕</button>
+    <div class="modal-title">📋 Assign Worker</div>
+    <p style="font-size:.875rem;color:var(--text-secondary);margin-bottom:20px">Enter contractor name to assign this worker. They will show as <strong>Busy</strong>.</p>
+    <div class="form-group">
+      <label class="form-label">Contractor Name (can write in Hindi / Telugu)</label>
+      <input class="form-input" type="text" id="contractorNameInput" placeholder="e.g. రాహుల్ కాంట్రాక్టర్"/>
     </div>
-
-    <!-- NAVIGATION TABS -->
-    <div class="tabs-bar">
-        <button class="tab-btn active" id="btn-labours" onclick="switchTab('tab-labours')">
-            <i class="fa-solid fa-users"></i> <span id="lbl-tabWorkers">Find Labours</span>
-        </button>
-        <button class="tab-btn" id="btn-jobs" onclick="switchTab('tab-jobs')">
-            <i class="fa-solid fa-briefcase"></i> <span id="lbl-tabJobs">Contractor Jobs</span>
-        </button>
-        <button class="tab-btn" id="btn-reg-labour" onclick="switchTab('tab-reg-labour')">
-            <i class="fa-solid fa-user-plus"></i> <span id="lbl-tabRegWorker">Register Worker</span>
-        </button>
-        <button class="tab-btn" id="btn-post-job" onclick="switchTab('tab-post-job')">
-            <i class="fa-solid fa-camera"></i> <span id="lbl-tabPostJob">Post Requirement & Photo</span>
-        </button>
-        <!-- ADMIN ONLY TAB: TOTALLY HIDDEN FOR USERS -->
-        <button class="tab-btn" id="btn-backup" onclick="switchTab('tab-backup')">
-            <i class="fa-solid fa-user-shield"></i> <span id="lbl-tabBackup">Admin Management</span>
-        </button>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary btn-full" onclick="confirmAssign()">✔ Assign Worker</button>
+      <button class="btn btn-outline" onclick="closeHireModal()">Cancel</button>
     </div>
+  </div>
+</div>
 
-    <!-- MAIN CONTAINER -->
-    <main>
+<!-- ══════════════════════════════════════════
+     REVIEW MODAL
+══════════════════════════════════════════ -->
+<div id="reviewModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="modal-close" onclick="closeReviewModal()">✕</button>
+    <div class="modal-title">⭐ Rate this Worker</div>
+    <div class="form-group">
+      <label class="form-label">Your Name</label>
+      <input class="form-input" type="text" id="reviewerName" placeholder="Your name"/>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Rating</label>
+      <select class="form-input" id="reviewRating">
+        <option value="5">⭐⭐⭐⭐⭐ Excellent (5)</option>
+        <option value="4">⭐⭐⭐⭐ Good (4)</option>
+        <option value="3">⭐⭐⭐ Average (3)</option>
+        <option value="2">⭐⭐ Poor (2)</option>
+        <option value="1">⭐ Very Poor (1)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Your Review</label>
+      <textarea class="form-input" id="reviewComment" rows="3" placeholder="Describe your experience..."></textarea>
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary btn-full" onclick="submitReview()">Submit Review</button>
+      <button class="btn btn-outline" onclick="closeReviewModal()">Cancel</button>
+    </div>
+  </div>
+</div>
 
-        <!-- TAB 1: WORKERS DIRECTORY -->
-        <div id="tab-labours" class="tab-content">
-            <div class="filter-bar">
-                <input type="text" id="labourSearch" class="search-input" placeholder="🔍 Search worker name (Telugu/Hindi/English), city, or trade..." oninput="filterLabours()">
-                <select id="labourSkillFilter" class="filter-select" onchange="filterLabours()">
-                    <option value="">All Trades (सभी काम / అన్ని పనులు)</option>
-                    <option value="Mason">Mason (Mistri / మేస్త్రీ)</option>
-                    <option value="Electrician">Electrician (इलेक्ट्रीशियन / ఎలక్ట్రీషియన్)</option>
-                    <option value="Plumber">Plumber (प्लंबर / ప్లంబర్)</option>
-                    <option value="Painter">Painter (पेंटर / పెయింటర్)</option>
-                    <option value="Carpenter">Carpenter (बढ़ई / కార్పెంటర్)</option>
-                    <option value="Tile">Tile & Marble (टाइल फिटर)</option>
-                    <option value="Helper">General Helper (हेल्पर / సహాయకుడు)</option>
-                </select>
-            </div>
-            <div id="labourList" class="items-grid">
-                <p style="color: #64748b; padding: 30px;">Loading verified workers from database...</p>
-            </div>
+<!-- ══════════════════════════════════════════
+     TOP NAVIGATION
+══════════════════════════════════════════ -->
+<nav id="topNav">
+  <div class="nav-logo" onclick="showPage('home')">Shramik<span>Link</span></div>
+  <div class="nav-links">
+    <button class="nav-link" onclick="showPage('home')" id="nl-home">Home</button>
+    <button class="nav-link" onclick="showPage('workers')" id="nl-workers">Find Workers</button>
+    <button class="nav-link" onclick="showPage('jobs')" id="nl-jobs">Jobs</button>
+    <button class="nav-link" onclick="showPage('register')" id="nl-register">Register</button>
+    <button class="nav-link" onclick="showPage('post')" id="nl-post">Post a Job</button>
+    <button class="nav-link admin-only" onclick="showPage('admin')" id="nl-admin">⚙ Admin</button>
+  </div>
+  <div class="nav-spacer"></div>
+  <div class="nav-lang">
+    <button class="lang-btn active" onclick="setLang('en')" id="lb-en">EN</button>
+    <button class="lang-btn" onclick="setLang('hi')" id="lb-hi">हिन्दी</button>
+    <button class="lang-btn" onclick="setLang('te')" id="lb-te">తెలుగు</button>
+  </div>
+  <button class="nav-cta" onclick="showPage('register')" id="nav-join-btn">Join as Worker</button>
+  <div class="nav-burger" onclick="toggleMobileMenu()">
+    <span></span><span></span><span></span>
+  </div>
+</nav>
+
+<!-- Mobile Menu Drawer (simple) -->
+<div id="mobileMenu" style="display:none;position:fixed;top:64px;left:0;right:0;background:#fff;border-bottom:1px solid var(--border);z-index:998;padding:16px;">
+  <div style="display:flex;flex-direction:column;gap:4px">
+    <button class="nav-link" onclick="showPage('home');toggleMobileMenu()">🏠 Home</button>
+    <button class="nav-link" onclick="showPage('workers');toggleMobileMenu()">👷 Find Workers</button>
+    <button class="nav-link" onclick="showPage('jobs');toggleMobileMenu()">💼 Jobs</button>
+    <button class="nav-link" onclick="showPage('register');toggleMobileMenu()">📝 Register</button>
+    <button class="nav-link" onclick="showPage('post');toggleMobileMenu()">📮 Post a Job</button>
+    <button class="nav-link admin-only" onclick="showPage('admin');toggleMobileMenu()">⚙ Admin Panel</button>
+  </div>
+  <div style="display:flex;gap:6px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+    <button class="lang-btn active" onclick="setLang('en')" style="flex:1;padding:10px;border-radius:8px;border:1.5px solid var(--border);cursor:pointer;font-family:var(--font-main)">EN</button>
+    <button class="lang-btn" onclick="setLang('hi')" style="flex:1;padding:10px;border-radius:8px;border:1.5px solid var(--border);cursor:pointer;font-family:var(--font-main)">हिन्दी</button>
+    <button class="lang-btn" onclick="setLang('te')" style="flex:1;padding:10px;border-radius:8px;border:1.5px solid var(--border);cursor:pointer;font-family:var(--font-main)">తెలుగు</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     BOTTOM NAV (Mobile)
+══════════════════════════════════════════ -->
+<nav id="bottomNav">
+  <button class="bottom-nav-item active" onclick="showPage('home')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+    <span id="bn-home">Home</span>
+  </button>
+  <button class="bottom-nav-item" onclick="showPage('workers')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    <span id="bn-workers">Workers</span>
+  </button>
+  <button class="bottom-nav-item bnav-post" onclick="showPage('post')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    <span id="bn-post">Post</span>
+  </button>
+  <button class="bottom-nav-item" onclick="showPage('jobs')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>
+    <span id="bn-jobs">Jobs</span>
+  </button>
+  <button class="bottom-nav-item" onclick="showPage('register')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+    <span id="bn-register">Join</span>
+  </button>
+</nav>
+
+<!-- ══════════════════════════════════════════
+     MAIN CONTENT
+══════════════════════════════════════════ -->
+<div id="appContent">
+
+  <!-- ── HOME PAGE ───────────────────────── -->
+  <div id="page-home" class="page active">
+
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-bg"></div>
+      <div class="container hero-content">
+        <div class="hero-badge">🏆 India's Local Labour Marketplace</div>
+        <h1 class="hero-title" id="h-hero-title">Find <span>Skilled Workers</span><br/>Near You, Instantly</h1>
+        <p class="hero-sub" id="h-hero-sub">Connect with verified masons, electricians, plumbers and more. Trusted by homeowners and contractors across India.</p>
+        <div class="hero-search">
+          <input type="text" id="heroSearch" placeholder="Search skill, location..." oninput="heroSearchFilter()"/>
+          <button onclick="heroSearchGo()" id="h-search-btn">🔍 Search Workers</button>
         </div>
-
-        <!-- TAB 2: CONTRACTOR & HOMEOWNER REQUIREMENTS -->
-        <div id="tab-jobs" class="tab-content" style="display: none;">
-            <div class="filter-bar">
-                <input type="text" id="jobSearch" class="search-input" placeholder="🔍 Search site location, contractor/homeowner name, or work..." oninput="filterJobs()">
-            </div>
-            <div id="jobsList" class="items-grid">
-                <p style="color: #64748b; padding: 30px;">Loading active requirements...</p>
-            </div>
+        <div class="hero-stats">
+          <div class="hero-stat">
+            <div class="hero-stat-num" id="stat-workers">—</div>
+            <div class="hero-stat-label" id="h-stat-workers">Skilled Workers</div>
+          </div>
+          <div class="hero-stat">
+            <div class="hero-stat-num" id="stat-jobs">—</div>
+            <div class="hero-stat-label" id="h-stat-jobs">Active Jobs</div>
+          </div>
+          <div class="hero-stat">
+            <div class="hero-stat-num" id="stat-cities">—</div>
+            <div class="hero-stat-label" id="h-stat-cities">Cities</div>
+          </div>
         </div>
+      </div>
+    </section>
 
-        <!-- TAB 3: REGISTER WORKER -->
-        <div id="tab-reg-labour" class="tab-content" style="display: none;">
-            <div class="form-card">
-                <h3 class="form-title"><i class="fa-solid fa-id-card" style="color: var(--accent-gold);"></i> <span id="form-workerTitle">Register as Worker</span></h3>
-                <p class="form-desc" id="form-workerDesc">Enter your trade and phone to receive direct daily job calls from local contractors.</p>
-
-                <form id="formLabour" onsubmit="submitLabour(event)">
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-wName">Full Name * (Accepts English, हिन्दी, తెలుగు)</label>
-                        <input type="text" id="labName" class="form-input" placeholder="e.g. Ramesh Kumar / రమేష్ కుమార్" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-wPhone">Phone / WhatsApp Number * (One Number Only)</label>
-                        <input type="tel" id="labPhone" class="form-input" placeholder="e.g. 9876543210" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-wSkill">Primary Skill / Trade *</label>
-                        <select id="labSkill" class="form-select" required>
-                            <option value="Mason (Mistri)">Mason (Mistri / Construction)</option>
-                            <option value="Electrician">Electrician (Electrical Wiring)</option>
-                            <option value="Plumber">Plumber (Sanitary & Pipes)</option>
-                            <option value="Painter">Painter (Putty, Texture & Paint)</option>
-                            <option value="Carpenter">Carpenter (Wood & Shuttering)</option>
-                            <option value="Tile & Marble">Tile & Marble Fitter</option>
-                            <option value="Welder">Welder & Fabrication</option>
-                            <option value="General Helper">General Construction Helper</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-wLoc">City / Work Area *</label>
-                        <input type="text" id="labLoc" class="form-input" placeholder="e.g. Hyderabad, Madhapur" required>
-                    </div>
-                    <div style="display: flex; gap: 12px;">
-                        <div class="form-group" style="flex: 1;">
-                            <label class="form-label" id="lbl-wExp">Experience</label>
-                            <input type="text" id="labExp" class="form-input" placeholder="e.g. 5 Years">
-                        </div>
-                        <div class="form-group" style="flex: 1;">
-                            <label class="form-label" id="lbl-wWage">Expected Daily Wage</label>
-                            <input type="text" id="labWage" class="form-input" placeholder="e.g. ₹800 / day">
-                        </div>
-                    </div>
-                    <button type="submit" class="btn-submit" id="btn-subWorker"><i class="fa-solid fa-check-circle"></i> Submit & Register Profile</button>
-                </form>
-            </div>
+    <!-- Categories -->
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-eyebrow" id="h-cats-eyebrow">Popular Services</div>
+          <h2 class="section-title" id="h-cats-title">What service do you need?</h2>
+          <p class="section-sub" id="h-cats-sub">Browse skilled workers by trade category</p>
         </div>
-
-        <!-- TAB 4: POST REQUIREMENT -->
-        <div id="tab-post-job" class="tab-content" style="display: none;">
-            <div class="form-card">
-                <h3 class="form-title"><i class="fa-solid fa-camera" style="color: var(--accent-gold);"></i> <span id="form-jobTitle">Post Job Requirement with Photo</span></h3>
-                <p class="form-desc" id="form-jobDesc">Contractors or homeowners can post requirements and upload a photo of the work site or problem.</p>
-
-                <form id="formJob" onsubmit="submitJob(event)">
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-jContractor">Contractor / Homeowner Name *</label>
-                        <input type="text" id="jobContractor" class="form-input" placeholder="e.g. Apex Infra / Homeowner Suresh" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-jPhone">Contact Phone / WhatsApp *</label>
-                        <input type="tel" id="jobPhone" class="form-input" placeholder="e.g. 9988776655" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-jWork">Type of Work Needed *</label>
-                        <input type="text" id="jobWorkType" class="form-input" placeholder="e.g. Bathroom Tile Leakage / RCC Slab" required>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-jLoc">Site Location *</label>
-                        <input type="text" id="jobLocation" class="form-input" placeholder="e.g. Hyderabad, Kukatpally" required>
-                    </div>
-                    <div style="display: flex; gap: 12px;">
-                        <div class="form-group" style="flex: 1;">
-                            <label class="form-label" id="lbl-jCount">Workers Needed *</label>
-                            <input type="number" id="jobWorkers" class="form-input" placeholder="e.g. 3" min="1" required>
-                        </div>
-                        <div class="form-group" style="flex: 1;">
-                            <label class="form-label" id="lbl-jWage">Daily Wage Offered</label>
-                            <input type="text" id="jobWage" class="form-input" placeholder="e.g. ₹900 / day" required>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">📷 Upload Photo of Work / Problem (Optional)</label>
-                        <input type="file" id="jobPhotoInput" accept="image/*" class="form-input" onchange="previewJobPhoto(event)">
-                        <div id="jobPhotoPreviewBox" class="photo-preview-box">
-                            <img id="jobPhotoPreviewImg" src="" alt="Work Photo Preview">
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" id="lbl-jDetails">Job Scope & Requirements</label>
-                        <textarea id="jobReqs" class="form-textarea" rows="3" placeholder="e.g. 4 days work. Safety gear provided. Timely payment on site."></textarea>
-                    </div>
-                    <button type="submit" class="btn-submit" id="btn-subJob"><i class="fa-solid fa-paper-plane"></i> Publish Job Requirement</button>
-                </form>
-            </div>
+        <div class="category-grid" id="categoryGrid">
+          <!-- Filled by JS -->
         </div>
+      </div>
+    </section>
 
-        <!-- TAB 5: ADMIN MANAGEMENT (ACCESSIBLE ONLY TO ADMIN) -->
-        <div id="tab-backup" class="tab-content" style="display: none;">
-            <div class="backup-card">
-                <h3 class="form-title"><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin Control Center</h3>
-                <p class="form-desc">Full administrative authority unlocked. You can remove spam records or download complete snapshots.</p>
-
-                <div class="backup-row">
-                    <div>
-                        <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-download" style="color: var(--accent-gold);"></i> 1-Click Database Backup</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary);">Download complete snapshot of all labours, contractor jobs, and photos to your phone or PC.</p>
-                    </div>
-                    <a href="/api/backup" download="shramiklink_backup.json" class="tab-btn" style="text-decoration: none;">
-                        <i class="fa-solid fa-file-arrow-down"></i> Download JSON
-                    </a>
-                </div>
-
-                <div class="backup-row">
-                    <div>
-                        <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-rotate-left" style="color: var(--accent-blue);"></i> Restore Database</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary);">Restore records anytime without data loss.</p>
-                    </div>
-                    <div>
-                        <input type="file" id="restoreFile" accept=".json" style="display: none;" onchange="handleRestore(event)">
-                        <button class="tab-btn" onclick="document.getElementById('restoreFile').click()">
-                            <i class="fa-solid fa-upload"></i> Restore File
-                        </button>
-                    </div>
-                </div>
-
-                <div class="backup-row" style="background: rgba(30, 41, 59, 0.5); border-color: rgba(56, 189, 248, 0.4);">
-                    <div>
-                        <h4 style="color: #fff; margin-bottom: 4px;"><i class="fa-solid fa-envelope" style="color: var(--accent-blue);"></i> Help & Team Support (Gmail)</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary);">Send team inquiry to official support mailbox.</p>
-                    </div>
-                    <a href="mailto:support.shramiklink@gmail.com?subject=ShramikLink%20Inquiry%20from%20Website" class="tab-btn active" style="text-decoration: none;">
-                        <i class="fa-solid fa-paper-plane"></i> Email via Gmail
-                    </a>
-                </div>
-            </div>
+    <!-- How It Works -->
+    <section class="section section-dark">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-eyebrow" style="color:#fdba74" id="h-how-eyebrow">Simple & Fast</div>
+          <h2 class="section-title" id="h-how-title">How ShramikLink Works</h2>
+          <p class="section-sub" id="h-how-sub">Get skilled workers at your doorstep in 3 simple steps</p>
         </div>
+        <div class="how-grid">
+          <div class="how-step">
+            <div class="how-num">1</div>
+            <h3 id="h-how1-title">Search & Filter</h3>
+            <p id="h-how1-desc">Browse workers by skill, location, and experience. Use our powerful search to find exactly who you need.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-num">2</div>
+            <h3 id="h-how2-title">Connect Directly</h3>
+            <p id="h-how2-desc">Call or WhatsApp the worker directly. No middleman, no commission. Direct and transparent.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-num">3</div>
+            <h3 id="h-how3-title">Get the Work Done</h3>
+            <p id="h-how3-desc">Hire with confidence. Leave a review after work is complete to help future customers.</p>
+          </div>
+          <div class="how-step">
+            <div class="how-num">4</div>
+            <h3 id="h-how4-title">Post a Job</h3>
+            <p id="h-how4-desc">Can't find someone? Post your job requirement with a photo. Workers will see and reach out.</p>
+          </div>
+        </div>
+      </div>
+    </section>
 
-    </main>
+    <!-- Trust Section -->
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-eyebrow" id="h-trust-eyebrow">Why ShramikLink</div>
+          <h2 class="section-title" id="h-trust-title">Trusted by thousands across India</h2>
+        </div>
+        <div class="trust-grid">
+          <div class="trust-item">
+            <div class="trust-icon">✅</div>
+            <h4 id="h-t1-title">Verified Workers</h4>
+            <p id="h-t1-desc">All workers are manually listed with real phone numbers and skills verified.</p>
+          </div>
+          <div class="trust-item">
+            <div class="trust-icon">💬</div>
+            <h4 id="h-t2-title">Direct Communication</h4>
+            <p id="h-t2-desc">Call or WhatsApp workers directly. No apps needed for workers to respond.</p>
+          </div>
+          <div class="trust-item">
+            <div class="trust-icon">🌐</div>
+            <h4 id="h-t3-title">Multilingual</h4>
+            <p id="h-t3-desc">Available in English, Hindi, and Telugu. Workers can register in their own language.</p>
+          </div>
+          <div class="trust-item">
+            <div class="trust-icon">🆓</div>
+            <h4 id="h-t4-title">100% Free</h4>
+            <p id="h-t4-desc">No registration fees, no commission. Completely free for workers and customers.</p>
+          </div>
+        </div>
+      </div>
+    </section>
 
-    <!-- HIRE MODAL -->
-    <div id="hireModal" class="modal-overlay">
-        <div class="modal-content">
-            <button class="btn-modal-close" onclick="closeHireModal()">&times;</button>
-            <h3 class="modal-title"><i class="fa-solid fa-building-user" style="color: var(--accent-gold);"></i> Assign Worker to Contractor</h3>
-            <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">This will mark the worker as <b>Busy</b> and display that they are currently working with this contractor.</p>
+    <!-- CTA Band -->
+    <section class="section section-brand">
+      <div class="container text-center">
+        <h2 style="font-size:clamp(1.5rem,3vw,2.2rem);font-weight:800;margin-bottom:14px" id="h-cta-title">Are you a skilled worker? Join Today!</h2>
+        <p style="font-size:1rem;opacity:.85;margin-bottom:28px;max-width:480px;margin-left:auto;margin-right:auto" id="h-cta-sub">Register for free and get connected with customers and contractors near you.</p>
+        <button class="btn btn-lg" style="background:#fff;color:var(--brand-primary);font-weight:800;" onclick="showPage('register')" id="h-cta-btn">Register as Worker →</button>
+      </div>
+    </section>
+
+  </div><!-- /page-home -->
+
+  <!-- ── WORKERS PAGE ─────────────────────── -->
+  <div id="page-workers" class="page">
+    <div class="container" style="padding-top:36px;padding-bottom:60px">
+      <div style="margin-bottom:32px">
+        <h1 style="font-size:1.8rem;font-weight:800;margin-bottom:8px" id="w-title">Find Skilled Workers</h1>
+        <p style="color:var(--text-secondary)" id="w-sub">Browse and connect with workers in your area</p>
+      </div>
+
+      <div class="filters-bar">
+        <input class="filter-input" type="text" id="filterSearch" placeholder="Search name, skill, location..." oninput="applyWorkerFilters()"/>
+        <select class="filter-select" id="filterStatus" onchange="applyWorkerFilters()">
+          <option value="">All Status</option>
+          <option value="Available">✅ Available</option>
+          <option value="Busy">🔴 Busy</option>
+        </select>
+        <select class="filter-select" id="filterSkill" onchange="applyWorkerFilters()">
+          <option value="">All Skills</option>
+        </select>
+      </div>
+
+      <div id="workersGrid" class="workers-grid">
+        <div class="spinner"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── REGISTER PAGE ────────────────────── -->
+  <div id="page-register" class="page">
+    <div class="container" style="padding-top:40px;padding-bottom:80px">
+      <div class="wizard-card">
+        <div class="wizard-header">
+          <h2 id="reg-wizard-title">Register as a Skilled Worker</h2>
+          <p id="reg-wizard-sub">Join thousands of workers finding work near them</p>
+          <div class="wizard-progress-bar">
+            <div class="wizard-progress-fill" id="wizardProgressFill" style="width:25%"></div>
+          </div>
+          <div class="wizard-steps-indicator">
+            <div class="ws-dot active" id="wsd0"></div>
+            <div class="ws-dot" id="wsd1"></div>
+            <div class="ws-dot" id="wsd2"></div>
+            <div class="ws-dot" id="wsd3"></div>
+          </div>
+        </div>
+        <div class="wizard-body">
+
+          <!-- Step 1 -->
+          <div class="wizard-step active" id="wstep0">
+            <h3 style="font-size:1.1rem;font-weight:700;margin-bottom:4px" id="ws1-title">Personal Information</h3>
+            <p style="font-size:.85rem;color:var(--text-secondary);margin-bottom:24px" id="ws1-sub">Tell us your name and contact number</p>
             <div class="form-group">
-                <label class="form-label">Contractor / Firm Name *</label>
-                <input type="text" id="hireContractorName" class="form-input" placeholder="e.g. Apex Infra Builders" required>
+              <label class="form-label" id="lbl-name">Full Name (can type in Hindi or Telugu)</label>
+              <input class="form-input" type="text" id="reg_name" placeholder="e.g. రాజు కుమార్ or सुरेश यादव"/>
             </div>
-            <button class="btn-submit" onclick="confirmHire()"><i class="fa-solid fa-check"></i> Confirm Assignment</button>
+            <div class="form-group">
+              <label class="form-label" id="lbl-phone">Mobile Number (10 digits, unique)</label>
+              <input class="form-input" type="tel" id="reg_phone" maxlength="10" placeholder="9876543210"/>
+            </div>
+            <div class="form-group">
+              <label class="form-label" id="lbl-location">City / Area</label>
+              <input class="form-input" type="text" id="reg_location" placeholder="e.g. Hyderabad, Anantapur"/>
+            </div>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="wizard-step" id="wstep1">
+            <h3 style="font-size:1.1rem;font-weight:700;margin-bottom:4px" id="ws2-title">Work Details</h3>
+            <p style="font-size:.85rem;color:var(--text-secondary);margin-bottom:24px" id="ws2-sub">Tell us about your trade and experience</p>
+            <div class="form-group">
+              <label class="form-label" id="lbl-skill">Primary Skill / Trade</label>
+              <input class="form-input" type="text" id="reg_skill" placeholder="e.g. Mason, Electrician, Plumber..."/>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" id="lbl-exp">Experience</label>
+                <input class="form-input" type="text" id="reg_experience" placeholder="e.g. 5 years"/>
+              </div>
+              <div class="form-group">
+                <label class="form-label" id="lbl-wage">Daily Wage (₹)</label>
+                <input class="form-input" type="number" id="reg_wage" placeholder="e.g. 700"/>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 3: Review -->
+          <div class="wizard-step" id="wstep2">
+            <h3 style="font-size:1.1rem;font-weight:700;margin-bottom:20px" id="ws3-title">Review Your Details</h3>
+            <div id="regReviewCard" style="background:var(--bg-page);border-radius:var(--radius-md);padding:20px;font-size:.9rem;line-height:2">
+            </div>
+          </div>
+
+          <!-- Step 4: Success -->
+          <div class="wizard-step" id="wstep3" style="text-align:center;padding:20px 0">
+            <div style="font-size:4rem;margin-bottom:16px">🎉</div>
+            <h3 style="font-size:1.3rem;font-weight:800;margin-bottom:10px" id="ws4-title">Registration Successful!</h3>
+            <p style="color:var(--text-secondary);margin-bottom:28px" id="ws4-sub">You are now listed on ShramikLink. Contractors and customers can find you.</p>
+            <button class="btn btn-primary btn-full" onclick="showPage('workers')">View Workers Directory →</button>
+          </div>
+
+          <div class="wizard-nav" id="wizardNav">
+            <button class="btn btn-outline" id="wizardBackBtn" onclick="wizardBack()" style="display:none">← Back</button>
+            <button class="btn btn-primary" id="wizardNextBtn" onclick="wizardNext()">Next Step →</button>
+          </div>
         </div>
+      </div>
     </div>
+  </div>
 
-    <!-- LIGHTBOX -->
-    <div id="imageLightbox" class="modal-overlay" onclick="closeLightbox()">
-        <div style="max-width: 90%; max-height: 90%;">
-            <img id="lightboxImg" src="" style="width: 100%; height: auto; max-height: 80vh; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.8);">
+  <!-- ── POST JOB PAGE ─────────────────────── -->
+  <div id="page-post" class="page">
+    <div class="container" style="padding-top:40px;padding-bottom:80px">
+      <div class="post-card">
+        <div style="margin-bottom:28px">
+          <h1 style="font-size:1.6rem;font-weight:800;margin-bottom:6px" id="post-title">Post a Job / Work Requirement</h1>
+          <p style="color:var(--text-secondary)" id="post-sub">Describe what you need — workers and contractors will reach out</p>
         </div>
+
+        <div class="form-group">
+          <label class="form-label" id="lbl-cname">Your Name (Contractor / Customer)</label>
+          <input class="form-input" type="text" id="post_cname" placeholder="e.g. రాహుల్ రెడ్డి or Rahul Singh"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label" id="lbl-cphone">Your Mobile Number</label>
+          <input class="form-input" type="tel" id="post_cphone" maxlength="10" placeholder="9876543210"/>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" id="lbl-jloc">Work Location</label>
+            <input class="form-input" type="text" id="post_location" placeholder="e.g. Hyderabad"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label" id="lbl-wtype">Type of Work</label>
+            <input class="form-input" type="text" id="post_work_type" placeholder="e.g. Construction"/>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" id="lbl-wneeded">Workers Needed</label>
+            <input class="form-input" type="number" id="post_workers_needed" placeholder="e.g. 5" min="1"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label" id="lbl-jwage">Wage Offered (₹/day)</label>
+            <input class="form-input" type="number" id="post_wage" placeholder="e.g. 700"/>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" id="lbl-req">Requirements / Description</label>
+          <textarea class="form-input" id="post_requirements" rows="3" placeholder="Describe the work, skills needed, duration..."></textarea>
+        </div>
+
+        <!-- Photo Upload -->
+        <label class="form-label" id="lbl-photo">Upload Work Photo (Optional)</label>
+        <div class="photo-upload-zone" id="photoUploadZone" onclick="document.getElementById('photoFileInput').click()">
+          <div class="upload-icon">📷</div>
+          <div class="upload-text" id="upload-text-hint">Click to upload a photo of the work site or problem</div>
+          <img id="photoPreview" src="" alt="Preview"/>
+        </div>
+        <input type="file" id="photoFileInput" accept="image/*" style="display:none" onchange="handlePhotoUpload(this)"/>
+
+        <button class="btn btn-primary btn-full btn-lg" onclick="submitJob()" id="post-submit-btn">📮 Post Job Now</button>
+      </div>
     </div>
+  </div>
 
-    <!-- FLOATING WHATSAPP -->
-    <a href="https://wa.me/919876543210?text=Hello%20ShramikLink%20Support,%20I%20need%20help%20with%20finding%20workers." target="_blank" class="floating-whatsapp" title="Chat on WhatsApp">
-        <i class="fa-brands fa-whatsapp"></i>
-    </a>
+  <!-- ── JOBS PAGE ──────────────────────────── -->
+  <div id="page-jobs" class="page">
+    <div class="container" style="padding-top:36px;padding-bottom:80px">
+      <div style="margin-bottom:32px">
+        <h1 style="font-size:1.8rem;font-weight:800;margin-bottom:8px" id="jobs-title">Job Board</h1>
+        <p style="color:var(--text-secondary)" id="jobs-sub">Open job postings from contractors and homeowners</p>
+      </div>
+      <div id="jobsGrid" class="jobs-grid">
+        <div class="spinner"></div>
+      </div>
+    </div>
+  </div>
 
-    <!-- FOOTER -->
-    <footer>
-        <div class="footer-container">
-            <div class="footer-col">
-                <h4 style="color: var(--accent-gold); font-size: 18px;"><i class="fa-solid fa-helmet-safety"></i> ShramikLink</h4>
-                <p>India's dedicated construction workforce network connecting contractors, homeowners, and certified tradesmen directly with zero brokerage.</p>
-            </div>
-            <div class="footer-col">
-                <h4>Popular Trades</h4>
-                <ul>
-                    <li><a href="#" onclick="filterBySkill('Mason')">Masons (Mistri / మేస్త్రీ)</a></li>
-                    <li><a href="#" onclick="filterBySkill('Electrician')">Electricians (ఇంటి వైరింగ్)</a></li>
-                    <li><a href="#" onclick="filterBySkill('Plumber')">Plumbers (పైపులు, లీకేజీ)</a></li>
-                    <li><a href="#" onclick="filterBySkill('Painter')">Painters (రంగులు, పుట్టీ)</a></li>
-                    <li><a href="#" onclick="filterBySkill('Carpenter')">Carpenters (కార్పెంటర్)</a></li>
-                </ul>
-            </div>
-            <div class="footer-col">
-                <h4>Help & Contact</h4>
-                <ul>
-                    <li><a href="mailto:support.shramiklink@gmail.com"><i class="fa-solid fa-envelope"></i> support.shramiklink@gmail.com</a></li>
-                    <li><a href="https://wa.me/919876543210"><i class="fa-brands fa-whatsapp"></i> WhatsApp Help Line</a></li>
-                </ul>
-            </div>
-            <div class="footer-col">
-                <h4>Trust & Privacy</h4>
-                <p><i class="fa-solid fa-lock" style="color: var(--success);"></i> 256-Bit SSL Encrypted</p>
-                <p><i class="fa-solid fa-ban" style="color: var(--danger);"></i> One Number per Person</p>
-                <p><i class="fa-solid fa-user-shield" style="color: var(--accent-gold);"></i> Admin Password Protected</p>
-            </div>
+  <!-- ── ADMIN PAGE ─────────────────────────── -->
+  <div id="page-admin" class="page admin-only" style="display:none">
+    <div class="container" style="padding-top:36px;padding-bottom:80px">
+      <h1 style="font-size:1.8rem;font-weight:800;margin-bottom:28px">⚙ Admin Panel</h1>
+
+      <div class="admin-section-card">
+        <h3>📊 Platform Statistics</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px" id="adminStatsGrid">
+          <div class="spinner"></div>
         </div>
-        <div class="footer-bottom">
-            &copy; 2026 ShramikLink Technologies. All rights reserved. Connecting India's Skilled Builders & Daily Wage Workers.
+      </div>
+
+      <div class="admin-section-card">
+        <h3>💾 Database Backup & Restore</h3>
+        <p style="font-size:.875rem;color:var(--text-secondary);margin-bottom:16px">Download a full backup of all data or restore from a previous backup file.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="downloadBackup()">⬇ Download Backup</button>
+          <label class="btn btn-outline" style="cursor:pointer">
+            ⬆ Restore from Backup
+            <input type="file" id="restoreFile" accept=".json" style="display:none" onchange="restoreBackup(this)"/>
+          </label>
         </div>
-    </footer>
+      </div>
 
-    <div id="toast">Notice message</div>
+      <div class="admin-section-card">
+        <h3>👷 All Workers (Admin View)</h3>
+        <div id="adminWorkersTable" style="overflow-x:auto"></div>
+      </div>
 
-    <script>
-        let allLabours = [];
-        let allJobs = [];
-        let currentLang = 'en';
-        let currentAdminPin = '';
-        let activeHireLabourId = null;
-        let jobPhotoBase64 = '';
-        let userRole = 'none';
+      <div class="admin-section-card">
+        <h3>💼 All Jobs (Admin View)</h3>
+        <div id="adminJobsTable" style="overflow-x:auto"></div>
+      </div>
+    </div>
+  </div>
 
-        // ─────────────────────────────────────────────
-        // ROLE GATEWAY FUNCTIONS
-        // ─────────────────────────────────────────────
-        function enterAsUser() {
-            userRole = 'user';
-            // Hide the gateway overlay
-            document.getElementById('roleGateOverlay').style.display = 'none';
-            // Ensure no admin elements are visible
-            document.body.classList.remove('is-admin');
-            document.getElementById('btn-backup').style.display = 'none';
-            showToast("Welcome to ShramikLink!");
-        }
+</div><!-- /appContent -->
 
-        function showAdminPinPrompt() {
-            document.getElementById('roleSelectionView').style.display = 'none';
-            document.getElementById('adminPinView').style.display = 'block';
-            document.getElementById('gateAdminPin').focus();
-        }
+<!-- ══════════════════════════════════════════
+     FOOTER
+══════════════════════════════════════════ -->
+<footer>
+  <div class="container">
+    <div class="footer-grid">
+      <div>
+        <div class="footer-brand-name">Shramik<span>Link</span></div>
+        <p class="footer-desc">India's trusted platform connecting skilled workers with customers and contractors. Empowering local labour, one connection at a time.</p>
+        <div style="margin-top:16px;display:flex;gap:12px;align-items:center">
+          <a href="mailto:support.shramiklink@gmail.com" style="color:var(--brand-primary);font-size:.83rem;text-decoration:none">✉ support.shramiklink@gmail.com</a>
+        </div>
+      </div>
+      <div class="footer-col">
+        <h4>Platform</h4>
+        <ul>
+          <li><a href="#" onclick="showPage('workers')">Find Workers</a></li>
+          <li><a href="#" onclick="showPage('jobs')">Job Board</a></li>
+          <li><a href="#" onclick="showPage('register')">Register as Worker</a></li>
+          <li><a href="#" onclick="showPage('post')">Post a Job</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Trades</h4>
+        <ul>
+          <li><a href="#">Mason / Mistri</a></li>
+          <li><a href="#">Electrician</a></li>
+          <li><a href="#">Plumber</a></li>
+          <li><a href="#">Carpenter</a></li>
+          <li><a href="#">Painter</a></li>
+          <li><a href="#">Welder</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Support</h4>
+        <ul>
+          <li><a href="mailto:support.shramiklink@gmail.com">Contact Us</a></li>
+          <li><a href="https://wa.me/91XXXXXXXXXX" target="_blank">WhatsApp Support</a></li>
+          <li><a href="#">Privacy Policy</a></li>
+          <li><a href="#">Terms of Use</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2025 ShramikLink. All rights reserved. Made with ❤ for Indian workers.</span>
+      <span>EN | हिन्दी | తెలుగు</span>
+    </div>
+  </div>
+</footer>
 
-        function cancelAdminLogin() {
-            document.getElementById('adminPinView').style.display = 'none';
-            document.getElementById('roleSelectionView').style.display = 'flex';
-            document.getElementById('gateAdminPin').value = '';
-        }
+<!-- Floating WhatsApp Support Button -->
+<a href="https://wa.me/918886000000?text=Hello%20ShramikLink%20support%2C%20I%20need%20help." target="_blank" class="float-wa" title="WhatsApp Support">💬</a>
 
-        function submitAdminPin() {
-            const pin = document.getElementById('gateAdminPin').value.trim();
-            if (pin === "9999") {
-                userRole = 'admin';
-                currentAdminPin = pin;
-                document.body.classList.add('is-admin');
-                document.getElementById('roleGateOverlay').style.display = 'none';
-                showToast("Admin access granted! Management tools unlocked 🛡️");
-                renderLabours(allLabours);
-                renderJobs(allJobs);
-            } else {
-                showToast("Incorrect Password! Access denied.", true);
-                document.getElementById('gateAdminPin').value = '';
-            }
-        }
+<!-- ══════════════════════════════════════════
+     JAVASCRIPT
+══════════════════════════════════════════ -->
+<script>
+// ─── STATE ──────────────────────────────
+let currentLang = 'en';
+let allWorkers = [];
+let allJobs = [];
+let activeHireWorkerId = null;
+let activeReviewWorkerId = null;
+let currentWizardStep = 0;
+let regPhotoData = '';
+let postPhotoData = '';
 
-        // MULTILINGUAL DICTIONARY
-        const i18n = {
-            en: {
-                announcement: "National Direct Labour & Contractor Network • 0% Brokerage • 100% Free Direct Calling",
-                tagline: "National Workforce Portal",
-                verifiedBadge: "Verified Workers & Contractors",
-                heroTitle: "Connect Skilled Labours & Contractors",
-                heroSub: "Direct hiring without middlemen. Masons, Electricians, Plumbers, Painters & Helpers ready for immediate project onboarding.",
-                statWorkers: "Verified Workers",
-                statJobs: "Active Site Jobs",
-                statWhatsapp: "WhatsApp Contact",
-                tabWorkers: "Find Labours",
-                tabJobs: "Contractor Jobs",
-                tabRegWorker: "Register Worker",
-                tabPostJob: "Post Requirement & Photo",
-                tabBackup: "Admin Management",
-                workerTitle: "Register as Worker",
-                workerDesc: "Enter your trade and phone to receive direct daily job calls from local contractors.",
-                jobTitle: "Post Job Requirement with Photo",
-                jobDesc: "Contractors or homeowners can post requirements and upload a photo of the work site or problem.",
-                callWorker: "Call",
-                whatsappChat: "WhatsApp",
-                hireBtn: "🏢 Assign Contractor",
-                releaseBtn: "🟢 Mark Available",
-                busyWith: "Busy with"
-            },
-            hi: {
-                announcement: "भारत का अग्रणी मजदूर एवं ठेकेदार नेटवर्क • 0% दलाली • 100% फ्री डायरेक्ट कॉलिंग",
-                tagline: "राष्ट्रीय श्रमिक पोर्टल",
-                verifiedBadge: "सत्यापित मजदूर और ठेकेदार",
-                heroTitle: "कुशल मजदूर और ठेकेदारों को सीधे जोड़ें",
-                heroSub: "बिना किसी बिचौलिए या कमीशन के। मिस्त्री, इलेक्ट्रीशियन, प्लंबर, पेंटर और हेल्पर तुरंत काम के लिए उपलब्ध।",
-                statWorkers: "पंजीकृत मजदूर",
-                statJobs: "सक्रिय साइट कार्य",
-                statWhatsapp: "व्हाट्सएप संपर्क",
-                tabWorkers: "मजदूर खोजें",
-                tabJobs: "ठेकेदार के काम",
-                tabRegWorker: "मजदूर पंजीकरण",
-                tabPostJob: "काम व फोटो पोस्ट करें",
-                tabBackup: "एडमिन प्रबंधन",
-                workerTitle: "मजदूर के रूप में पंजीकरण करें",
-                workerDesc: "स्थानीय ठेकेदारों से सीधे काम के कॉल प्राप्त करने के लिए अपना विवरण दर्ज करें।",
-                jobTitle: "फोटो के साथ काम पोस्ट करें",
-                jobDesc: "ठेकेदार या घर के मालिक काम की आवश्यकता और फोटो अपलोड कर सकते हैं।",
-                callWorker: "कॉल करें",
-                whatsappChat: "व्हाट्सएप",
-                hireBtn: "🏢 ठेकेदार नियुक्त करें",
-                releaseBtn: "🟢 काम पूरा (उपलब्ध करें)",
-                busyWith: "काम पर व्यस्त:"
-            },
-            te: {
-                announcement: "భారతదేశ ప్రముఖ లేబర్ & కాంట్రాక్టర్ నెట్‌వర్క్ • 0% బ్రోకరేజ్ • ఉచిత డైరెక్ట్ కాలింగ్",
-                tagline: "జాతీయ శ్రామిక పోర్టల్",
-                verifiedBadge: "ధృవీకరించబడిన వర్కర్లు & కాంట్రాక్టర్లు",
-                heroTitle: "నైపుణ్యం కలిగిన లేబర్ & కాంట్రాక్టర్లను కలపండి",
-                heroSub: "దళారులు లేకుండా నేరుగా సంప్రదించండి. మేస్త్రీలు, ఎలక్ట్రీషియన్లు, ప్లంబర్లు, పెయింటర్లు సిద్ధంగా ఉన్నారు.",
-                statWorkers: "నమోదిత వర్కర్లు",
-                statJobs: "ప్రస్తుత పనులు",
-                statWhatsapp: "వాట్సాప్ కాంటాక్ట్",
-                tabWorkers: "లేబర్లను కనుగొనండి",
-                tabJobs: "కాంట్రాక్టర్ పనులు",
-                tabRegWorker: "వర్కర్ రిజిస్ట్రేషన్",
-                tabPostJob: "పని & ఫోటో పోస్ట్ చేయండి",
-                tabBackup: "అడ్మిన్ మేనేజ్‌మెంట్",
-                workerTitle: "వర్కర్‌గా నమోదు చేసుకోండి",
-                workerDesc: "కాంట్రాక్టర్ల నుండి నేరుగా కాల్స్ పొందడానికి మీ వివరాలను నమోదు చేయండి.",
-                jobTitle: "ఫోటోతో పని అవసరాన్ని పోస్ట్ చేయండి",
-                jobDesc: "కాంట్రాక్టర్లు లేదా ఇంటి యజమానులు పని ఫోటోను అప్‌లోడ్ చేయవచ్చు.",
-                callWorker: "కాల్ చేయండి",
-                whatsappChat: "వాట్సాప్",
-                hireBtn: "🏢 కాంట్రాక్టర్‌కు కేటాయించండి",
-                releaseBtn: "🟢 అందుబాటులోకి మార్చండి",
-                busyWith: "పనిలో ఉన్నారు:"
-            }
-        };
+const ADMIN_PIN = '9999';
+const CATEGORIES = [
+  { icon: '🧱', name: { en: 'Mason', hi: 'राजमिस्त्री', te: 'మేసన్' }, skill: 'Mason' },
+  { icon: '⚡', name: { en: 'Electrician', hi: 'बिजली मिस्त्री', te: 'ఎలెక్ట్రీషియన్' }, skill: 'Electrician' },
+  { icon: '🔧', name: { en: 'Plumber', hi: 'पाइप मिस्त्री', te: 'ప్లంబర్' }, skill: 'Plumber' },
+  { icon: '🪵', name: { en: 'Carpenter', hi: 'बढ़ई', te: 'కార్పెంటర్' }, skill: 'Carpenter' },
+  { icon: '🎨', name: { en: 'Painter', hi: 'पेंटर', te: 'పెయింటర్' }, skill: 'Painter' },
+  { icon: '🔩', name: { en: 'Welder', hi: 'वेल्डर', te: 'వెల్డర్' }, skill: 'Welder' },
+  { icon: '🏗️', name: { en: 'Labour', hi: 'मजदूर', te: 'కూలీ' }, skill: '' },
+  { icon: '🌿', name: { en: 'Gardener', hi: 'माली', te: 'తోటమాలి' }, skill: 'Gardener' },
+];
 
-        function setLanguage(lang) {
-            currentLang = lang;
-            document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
-            document.getElementById('lang-' + lang).classList.add('active');
+// ─── i18n ────────────────────────────────
+const i18n = {
+  en: {
+    'h-hero-title': 'Find <span style="color:var(--brand-primary)">Skilled Workers</span><br/>Near You, Instantly',
+    'h-hero-sub': 'Connect with verified masons, electricians, plumbers and more. Trusted by homeowners and contractors across India.',
+    'h-search-btn': '🔍 Search Workers',
+    'h-stat-workers': 'Skilled Workers',
+    'h-stat-jobs': 'Active Jobs',
+    'h-stat-cities': 'Cities',
+    'h-cats-eyebrow': 'Popular Services',
+    'h-cats-title': 'What service do you need?',
+    'h-cats-sub': 'Browse skilled workers by trade category',
+    'h-how-eyebrow': 'Simple & Fast',
+    'h-how-title': 'How ShramikLink Works',
+    'h-how-sub': 'Get skilled workers at your doorstep in 3 simple steps',
+    'h-how1-title': 'Search & Filter',
+    'h-how1-desc': 'Browse workers by skill, location, and experience. Use our powerful search to find exactly who you need.',
+    'h-how2-title': 'Connect Directly',
+    'h-how2-desc': 'Call or WhatsApp the worker directly. No middleman, no commission. Direct and transparent.',
+    'h-how3-title': 'Get the Work Done',
+    'h-how3-desc': 'Hire with confidence. Leave a review after work is complete to help future customers.',
+    'h-how4-title': 'Post a Job',
+    'h-how4-desc': "Can't find someone? Post your job requirement with a photo. Workers will see and reach out.",
+    'h-trust-eyebrow': 'Why ShramikLink',
+    'h-trust-title': 'Trusted by thousands across India',
+    'h-t1-title': 'Verified Workers',
+    'h-t1-desc': 'All workers are manually listed with real phone numbers and skills verified.',
+    'h-t2-title': 'Direct Communication',
+    'h-t2-desc': 'Call or WhatsApp workers directly. No apps needed for workers to respond.',
+    'h-t3-title': 'Multilingual',
+    'h-t3-desc': 'Available in English, Hindi, and Telugu. Workers can register in their own language.',
+    'h-t4-title': '100% Free',
+    'h-t4-desc': 'No registration fees, no commission. Completely free for workers and customers.',
+    'h-cta-title': 'Are you a skilled worker? Join Today!',
+    'h-cta-sub': 'Register for free and get connected with customers and contractors near you.',
+    'h-cta-btn': 'Register as Worker →',
+    'w-title': 'Find Skilled Workers',
+    'w-sub': 'Browse and connect with workers in your area',
+    'jobs-title': 'Job Board',
+    'jobs-sub': 'Open job postings from contractors and homeowners',
+    'post-title': 'Post a Job / Work Requirement',
+    'post-sub': 'Describe what you need — workers and contractors will reach out',
+    'lbl-cname': 'Your Name (Contractor / Customer)',
+    'lbl-cphone': 'Your Mobile Number',
+    'lbl-jloc': 'Work Location',
+    'lbl-wtype': 'Type of Work',
+    'lbl-wneeded': 'Workers Needed',
+    'lbl-jwage': 'Wage Offered (₹/day)',
+    'lbl-req': 'Requirements / Description',
+    'lbl-photo': 'Upload Work Photo (Optional)',
+    'upload-text-hint': 'Click to upload a photo of the work site or problem',
+    'post-submit-btn': '📮 Post Job Now',
+    'reg-wizard-title': 'Register as a Skilled Worker',
+    'reg-wizard-sub': 'Join thousands of workers finding work near them',
+    'ws1-title': 'Personal Information',
+    'ws1-sub': 'Tell us your name and contact number',
+    'lbl-name': 'Full Name (can type in Hindi or Telugu)',
+    'lbl-phone': 'Mobile Number (10 digits, unique)',
+    'lbl-location': 'City / Area',
+    'ws2-title': 'Work Details',
+    'ws2-sub': 'Tell us about your trade and experience',
+    'lbl-skill': 'Primary Skill / Trade',
+    'lbl-exp': 'Experience',
+    'lbl-wage': 'Daily Wage (₹)',
+    'ws3-title': 'Review Your Details',
+    'ws4-title': 'Registration Successful!',
+    'ws4-sub': 'You are now listed on ShramikLink. Contractors and customers can find you.',
+    'bn-home': 'Home', 'bn-workers': 'Workers', 'bn-post': 'Post', 'bn-jobs': 'Jobs', 'bn-register': 'Join',
+    'nav-join-btn': 'Join as Worker',
+  },
+  hi: {
+    'h-hero-title': '<span style="color:var(--brand-primary)">कुशल मजदूर</span> खोजें<br/>अपने पास, तुरंत',
+    'h-hero-sub': 'सत्यापित राजमिस्त्री, बिजली मिस्त्री, पाइप मिस्त्री और अधिक के साथ जुड़ें।',
+    'h-search-btn': '🔍 मजदूर खोजें',
+    'h-stat-workers': 'कुशल मजदूर',
+    'h-stat-jobs': 'सक्रिय काम',
+    'h-stat-cities': 'शहर',
+    'h-cats-eyebrow': 'लोकप्रिय सेवाएं',
+    'h-cats-title': 'आपको कौनसी सेवा चाहिए?',
+    'h-cats-sub': 'व्यापार श्रेणी के अनुसार कुशल मजदूर देखें',
+    'h-how-eyebrow': 'सरल और तेज़',
+    'h-how-title': 'श्रमिक लिंक कैसे काम करता है',
+    'h-how-sub': '3 आसान चरणों में अपने दरवाजे पर कुशल मजदूर पाएं',
+    'h-how1-title': 'खोजें और फ़िल्टर करें',
+    'h-how1-desc': 'कौशल, स्थान और अनुभव के अनुसार मजदूर देखें।',
+    'h-how2-title': 'सीधे जुड़ें',
+    'h-how2-desc': 'मजदूर को सीधे कॉल या WhatsApp करें। कोई बिचौलिया नहीं।',
+    'h-how3-title': 'काम पूरा कराएं',
+    'h-how3-desc': 'आत्मविश्वास के साथ काम कराएं। काम पूरा होने के बाद समीक्षा छोड़ें।',
+    'h-how4-title': 'काम पोस्ट करें',
+    'h-how4-desc': 'नहीं मिला? काम की जरूरत फोटो के साथ पोस्ट करें।',
+    'h-trust-eyebrow': 'श्रमिक लिंक क्यों',
+    'h-trust-title': 'भारत भर में हजारों लोगों का भरोसा',
+    'h-t1-title': 'सत्यापित मजदूर',
+    'h-t1-desc': 'सभी मजदूर असली फोन नंबर और कौशल के साथ सूचीबद्ध हैं।',
+    'h-t2-title': 'सीधी बातचीत',
+    'h-t2-desc': 'मजदूरों को सीधे कॉल या WhatsApp करें।',
+    'h-t3-title': 'बहुभाषी',
+    'h-t3-desc': 'अंग्रेजी, हिंदी और तेलुगु में उपलब्ध।',
+    'h-t4-title': '100% मुफ्त',
+    'h-t4-desc': 'कोई पंजीकरण शुल्क नहीं, कोई कमीशन नहीं।',
+    'h-cta-title': 'क्या आप एक कुशल मजदूर हैं? आज जुड़ें!',
+    'h-cta-sub': 'मुफ्त में पंजीकरण करें और अपने पास के ग्राहकों से जुड़ें।',
+    'h-cta-btn': 'मजदूर के रूप में पंजीकरण करें →',
+    'w-title': 'कुशल मजदूर खोजें',
+    'w-sub': 'अपने क्षेत्र में मजदूरों को देखें और जुड़ें',
+    'jobs-title': 'काम बोर्ड',
+    'jobs-sub': 'ठेकेदारों और गृहस्वामियों से खुले काम के पोस्ट',
+    'post-title': 'काम पोस्ट करें',
+    'post-sub': 'बताएं आपको क्या चाहिए — मजदूर और ठेकेदार आपसे संपर्क करेंगे',
+    'lbl-cname': 'आपका नाम (ठेकेदार / ग्राहक)',
+    'lbl-cphone': 'आपका मोबाइल नंबर',
+    'lbl-jloc': 'काम का स्थान',
+    'lbl-wtype': 'काम का प्रकार',
+    'lbl-wneeded': 'आवश्यक मजदूर',
+    'lbl-jwage': 'दैनिक मजदूरी (₹)',
+    'lbl-req': 'आवश्यकताएं / विवरण',
+    'lbl-photo': 'काम की फोटो अपलोड करें (वैकल्पिक)',
+    'upload-text-hint': 'काम की जगह या समस्या की फोटो अपलोड करें',
+    'post-submit-btn': '📮 काम पोस्ट करें',
+    'reg-wizard-title': 'कुशल मजदूर के रूप में पंजीकरण करें',
+    'reg-wizard-sub': 'हजारों मजदूरों के साथ जुड़ें जो पास में काम पाते हैं',
+    'ws1-title': 'व्यक्तिगत जानकारी',
+    'ws1-sub': 'अपना नाम और संपर्क नंबर बताएं',
+    'lbl-name': 'पूरा नाम (हिंदी या तेलुगु में लिख सकते हैं)',
+    'lbl-phone': 'मोबाइल नंबर (10 अंक, अद्वितीय)',
+    'lbl-location': 'शहर / क्षेत्र',
+    'ws2-title': 'काम का विवरण',
+    'ws2-sub': 'अपने व्यापार और अनुभव के बारे में बताएं',
+    'lbl-skill': 'मुख्य कौशल / व्यापार',
+    'lbl-exp': 'अनुभव',
+    'lbl-wage': 'दैनिक मजदूरी (₹)',
+    'ws3-title': 'अपनी जानकारी जांचें',
+    'ws4-title': 'पंजीकरण सफल!',
+    'ws4-sub': 'आप अब श्रमिक लिंक पर सूचीबद्ध हैं।',
+    'bn-home': 'होम', 'bn-workers': 'मजदूर', 'bn-post': 'पोस्ट', 'bn-jobs': 'काम', 'bn-register': 'जुड़ें',
+    'nav-join-btn': 'मजदूर बनें',
+  },
+  te: {
+    'h-hero-title': '<span style="color:var(--brand-primary)">నైపుణ్యమైన కూలీలు</span><br/>మీ దగ్గర, వెంటనే',
+    'h-hero-sub': 'నిర్ధారిత మేసన్లు, ఎలెక్ట్రీషియన్లు, ప్లంబర్లు మరియు మరిన్నింటితో కనెక్ట్ అవ్వండి.',
+    'h-search-btn': '🔍 కూలీలను వెతకండి',
+    'h-stat-workers': 'నైపుణ్యమైన కూలీలు',
+    'h-stat-jobs': 'చురుకైన పనులు',
+    'h-stat-cities': 'నగరాలు',
+    'h-cats-eyebrow': 'ప్రముఖ సేవలు',
+    'h-cats-title': 'మీకు ఏ సేవ కావాలి?',
+    'h-cats-sub': 'వ్యాపార వర్గం ద్వారా నైపుణ్యమైన కూలీలను చూడండి',
+    'h-how-eyebrow': 'సులభం మరియు వేగంగా',
+    'h-how-title': 'శ్రమిక్ లింక్ ఎలా పని చేస్తుంది',
+    'h-how-sub': '3 సులభమైన దశల్లో మీ తలుపు దగ్గర నైపుణ్యమైన కూలీలను పొందండి',
+    'h-how1-title': 'వెతకండి & ఫిల్టర్ చేయండి',
+    'h-how1-desc': 'నైపుణ్యం, స్థానం మరియు అనుభవం ప్రకారం కూలీలను చూడండి.',
+    'h-how2-title': 'నేరుగా కనెక్ట్ అవ్వండి',
+    'h-how2-desc': 'కూలీకి నేరుగా కాల్ చేయండి లేదా WhatsApp చేయండి.',
+    'h-how3-title': 'పని పూర్తి చేయండి',
+    'h-how3-desc': 'నమ్మకంతో పని చేయించుకోండి. పని పూర్తయిన తర్వాత సమీక్ష రాయండి.',
+    'h-how4-title': 'పని పోస్ట్ చేయండి',
+    'h-how4-desc': 'కనుగొనలేదా? ఫోటోతో మీ పని అవసరాన్ని పోస్ట్ చేయండి.',
+    'h-trust-eyebrow': 'శ్రమిక్ లింక్ ఎందుకు',
+    'h-trust-title': 'భారతదేశం అంతటా వేలాది మంది నమ్మిన వేదిక',
+    'h-t1-title': 'నిర్ధారిత కూలీలు',
+    'h-t1-desc': 'అన్ని కూలీలు నిజమైన ఫోన్ నంబర్లు మరియు నైపుణ్యాలతో జాబితా చేయబడ్డారు.',
+    'h-t2-title': 'నేరుగా సంభాషించండి',
+    'h-t2-desc': 'కూలీలకు నేరుగా కాల్ చేయండి లేదా WhatsApp చేయండి.',
+    'h-t3-title': 'బహుభాషీయ',
+    'h-t3-desc': 'ఇంగ్లీష్, హిందీ మరియు తెలుగులో అందుబాటులో ఉంది.',
+    'h-t4-title': '100% ఉచితం',
+    'h-t4-desc': 'నమోదు రుసుము లేదు, కమీషన్ లేదు.',
+    'h-cta-title': 'మీరు నైపుణ్యమైన కూలీయా? ఈరోజే చేరండి!',
+    'h-cta-sub': 'ఉచితంగా నమోదు చేసుకోండి మరియు మీ దగ్గరి కస్టమర్లతో కనెక్ట్ అవ్వండి.',
+    'h-cta-btn': 'కూలీగా నమోదు చేసుకోండి →',
+    'w-title': 'నైపుణ్యమైన కూలీలను కనుగొనండి',
+    'w-sub': 'మీ ప్రాంతంలో కూలీలను చూడండి మరియు కనెక్ట్ అవ్వండి',
+    'jobs-title': 'జాబ్ బోర్డ్',
+    'jobs-sub': 'కాంట్రాక్టర్లు మరియు గృహ యజమానుల నుండి తెరిచిన పని పోస్టులు',
+    'post-title': 'పని పోస్ట్ చేయండి',
+    'post-sub': 'మీకు ఏమి కావాలో వివరించండి — కూలీలు మరియు కాంట్రాక్టర్లు సంప్రదిస్తారు',
+    'lbl-cname': 'మీ పేరు (కాంట్రాక్టర్ / కస్టమర్)',
+    'lbl-cphone': 'మీ మొబైల్ నంబర్',
+    'lbl-jloc': 'పని స్థానం',
+    'lbl-wtype': 'పని రకం',
+    'lbl-wneeded': 'అవసరమైన కూలీలు',
+    'lbl-jwage': 'రోజు వేతనం (₹)',
+    'lbl-req': 'అవసరాలు / వివరణ',
+    'lbl-photo': 'పని ఫోటో అప్‌లోడ్ చేయండి (ఐచ్ఛికం)',
+    'upload-text-hint': 'పని స్థలం లేదా సమస్య ఫోటో అప్‌లోడ్ చేయండి',
+    'post-submit-btn': '📮 పని పోస్ట్ చేయండి',
+    'reg-wizard-title': 'నైపుణ్యమైన కూలీగా నమోదు చేసుకోండి',
+    'reg-wizard-sub': 'దగ్గర పని కనుగొంటున్న వేలాది కూలీలతో చేరండి',
+    'ws1-title': 'వ్యక్తిగత సమాచారం',
+    'ws1-sub': 'మీ పేరు మరియు సంప్రదింపు నంబర్ చెప్పండి',
+    'lbl-name': 'పూర్తి పేరు (తెలుగు లేదా హిందీలో టైప్ చేయవచ్చు)',
+    'lbl-phone': 'మొబైల్ నంబర్ (10 అంకెలు, ప్రత్యేకమైనది)',
+    'lbl-location': 'నగరం / ప్రాంతం',
+    'ws2-title': 'పని వివరాలు',
+    'ws2-sub': 'మీ వ్యాపారం మరియు అనుభవం గురించి చెప్పండి',
+    'lbl-skill': 'ప్రాథమిక నైపుణ్యం / వ్యాపారం',
+    'lbl-exp': 'అనుభవం',
+    'lbl-wage': 'రోజు వేతనం (₹)',
+    'ws3-title': 'మీ వివరాలు తనిఖీ చేయండి',
+    'ws4-title': 'నమోదు విజయవంతమైంది!',
+    'ws4-sub': 'మీరు ఇప్పుడు శ్రమిక్ లింక్‌లో జాబితా చేయబడ్డారు.',
+    'bn-home': 'హోమ్', 'bn-workers': 'కూలీలు', 'bn-post': 'పోస్ట్', 'bn-jobs': 'పనులు', 'bn-register': 'చేరు',
+    'nav-join-btn': 'కూలీగా చేరండి',
+  }
+};
 
-            const t = i18n[lang];
-            document.getElementById('txt-announcement').innerText = t.announcement;
-            document.getElementById('txt-tagline').innerText = t.tagline;
-            document.getElementById('txt-verifiedBadge').innerText = t.verifiedBadge;
-            document.getElementById('txt-heroTitle').innerText = t.heroTitle;
-            document.getElementById('txt-heroSub').innerText = t.heroSub;
-            document.getElementById('txt-statWorkers').innerText = t.statWorkers;
-            document.getElementById('txt-statJobs').innerText = t.statJobs;
-            document.getElementById('txt-statWhatsapp').innerText = t.statWhatsapp;
+// ─── ENTRY GATE ──────────────────────────
+let pinBuffer = '';
 
-            document.getElementById('lbl-tabWorkers').innerText = t.tabWorkers;
-            document.getElementById('lbl-tabJobs').innerText = t.tabJobs;
-            document.getElementById('lbl-tabRegWorker').innerText = t.tabRegWorker;
-            document.getElementById('lbl-tabPostJob').innerText = t.tabPostJob;
-            document.getElementById('lbl-tabBackup').innerText = t.tabBackup;
+function enterAsUser() {
+  const overlay = document.getElementById('roleGateOverlay');
+  overlay.style.opacity = '0';
+  overlay.style.transition = 'opacity 0.5s ease';
+  setTimeout(() => {
+    overlay.style.display = 'none';
+  }, 500);
+  loadInitialData();
+}
 
-            document.getElementById('form-workerTitle').innerText = t.workerTitle;
-            document.getElementById('form-workerDesc').innerText = t.workerDesc;
-            document.getElementById('form-jobTitle').innerText = t.jobTitle;
-            document.getElementById('form-jobDesc').innerText = t.jobDesc;
+function showAdminPinEntry() {
+  document.getElementById('gateRoleSection').style.display = 'none';
+  document.getElementById('adminPinSection').classList.add('visible');
+  pinBuffer = '';
+  updatePinDots();
+}
 
-            renderLabours(allLabours);
-            renderJobs(allJobs);
-        }
+function showRoleSection() {
+  document.getElementById('gateRoleSection').style.display = 'block';
+  document.getElementById('adminPinSection').classList.remove('visible');
+  pinBuffer = '';
+  updatePinDots();
+  document.getElementById('pinError').textContent = '';
+}
 
-        function showToast(msg, isError = false) {
-            const t = document.getElementById('toast');
-            t.innerText = msg;
-            t.style.background = isError ? '#ef4444' : '#10b981';
-            t.className = "show";
-            setTimeout(() => { t.className = t.className.replace("show", ""); }, 3500);
-        }
+function pinPress(digit) {
+  if (pinBuffer.length >= 4) return;
+  pinBuffer += digit;
+  updatePinDots();
+  if (pinBuffer.length === 4) {
+    setTimeout(checkPin, 200);
+  }
+}
 
-        function switchTab(tabId) {
-            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-            
-            document.getElementById(tabId).style.display = 'block';
-            
-            const btnMap = {
-                'tab-labours': 'btn-labours',
-                'tab-jobs': 'btn-jobs',
-                'tab-reg-labour': 'btn-reg-labour',
-                'tab-post-job': 'btn-post-job',
-                'tab-backup': 'btn-backup'
-            };
-            if (btnMap[tabId]) document.getElementById(btnMap[tabId]).classList.add('active');
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-        }
+function pinBackspace() {
+  pinBuffer = pinBuffer.slice(0, -1);
+  updatePinDots();
+}
 
-        function cleanPhoneForWhatsapp(phone) {
-            let num = phone.replace(/[^0-9]/g, '');
-            if (num.length === 10) num = '91' + num;
-            return num;
-        }
+function pinClear() {
+  pinBuffer = '';
+  updatePinDots();
+}
 
-        function previewJobPhoto(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(event) {
-                jobPhotoBase64 = event.target.result;
-                document.getElementById('jobPhotoPreviewImg').src = jobPhotoBase64;
-                document.getElementById('jobPhotoPreviewBox').style.display = 'block';
-            };
-            reader.readAsDataURL(file);
-        }
+function updatePinDots() {
+  for (let i = 0; i < 4; i++) {
+    document.getElementById('dot' + i).classList.toggle('filled', i < pinBuffer.length);
+  }
+}
 
-        function openLightbox(src) {
-            document.getElementById('lightboxImg').src = src;
-            document.getElementById('imageLightbox').style.display = 'flex';
-        }
+function checkPin() {
+  if (pinBuffer === ADMIN_PIN) {
+    document.body.classList.add('is-admin');
+    const overlay = document.getElementById('roleGateOverlay');
+    overlay.style.opacity = '0';
+    overlay.style.transition = 'opacity 0.5s ease';
+    setTimeout(() => { overlay.style.display = 'none'; }, 500);
+    loadInitialData();
+    showPage('admin');
+    showToast('Admin access granted!', 'success');
+  } else {
+    document.getElementById('pinError').textContent = '❌ Wrong PIN. Please try again.';
+    pinBuffer = '';
+    updatePinDots();
+    // shake animation
+    const keypad = document.getElementById('pinKeypad');
+    keypad.style.animation = 'none';
+    keypad.offsetHeight;
+    keypad.style.animation = 'shake .4s ease';
+  }
+}
 
-        function closeLightbox() {
-            document.getElementById('imageLightbox').style.display = 'none';
-        }
+// ─── LANGUAGE ────────────────────────────
+function setLang(lang) {
+  currentLang = lang;
+  document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('lb-' + lang).classList.add('active');
+  const t = i18n[lang];
+  for (const [id, val] of Object.entries(t)) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = val;
+  }
+  // Update category grid labels
+  renderCategories();
+}
 
-        async function fetchAllData() {
-            try {
-                const [labRes, jobRes] = await Promise.all([
-                    fetch('/api/labours'),
-                    fetch('/api/jobs')
-                ]);
-                allLabours = await labRes.json();
-                allJobs = await jobRes.json();
+// ─── PAGE NAVIGATION ─────────────────────
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const page = document.getElementById('page-' + name);
+  if (page) page.classList.add('active');
 
-                document.getElementById('count-labours').innerText = allLabours.length;
-                document.getElementById('count-jobs').innerText = allJobs.length;
+  // Bottom nav active
+  document.querySelectorAll('.bottom-nav-item').forEach(b => b.classList.remove('active'));
 
-                renderLabours(allLabours);
-                renderJobs(allJobs);
-            } catch (err) {
-                console.error(err);
-                showToast("Error loading database records", true);
-            }
-        }
+  // Top nav active
+  document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+  const nl = document.getElementById('nl-' + name);
+  if (nl) nl.classList.add('active');
 
-        function renderLabours(list) {
-            const container = document.getElementById('labourList');
-            const t = i18n[currentLang];
-            if (list.length === 0) {
-                container.innerHTML = '<p style="color: #64748b; padding: 20px;">No workers match your filter criteria.</p>';
-                return;
-            }
-            container.innerHTML = list.map(l => {
-                const waPhone = cleanPhoneForWhatsapp(l.phone);
-                const waMsg = encodeURIComponent(`Hello ${l.name}, I saw your ${l.skill} profile on ShramikLink. Are you available for a project?`);
-                const isBusy = l.status === 'Busy';
-                
-                return `
-                <div class="item-card">
-                    <div>
-                        <div class="card-top">
-                            <div class="card-title">${l.name}</div>
-                            <span class="card-badge ${isBusy ? 'badge-busy' : 'badge-available'}">
-                                ${isBusy ? '🔴 Busy' : '🟢 Available'}
-                            </span>
-                        </div>
-                        
-                        ${isBusy && l.assigned_contractor ? `
-                            <div class="contractor-tag">
-                                <i class="fa-solid fa-building"></i> ${t.busyWith} <b>${l.assigned_contractor}</b>
-                            </div>
-                        ` : ''}
+  // Load data as needed
+  if (name === 'workers') loadWorkers();
+  if (name === 'jobs') loadJobs();
+  if (name === 'admin' && document.body.classList.contains('is-admin')) loadAdminData();
 
-                        <div class="card-row"><i class="fa-solid fa-hammer"></i> <b>Trade:</b> ${l.skill}</div>
-                        <div class="card-row"><i class="fa-solid fa-location-dot"></i> <b>City:</b> ${l.location}</div>
-                        <div class="card-row"><i class="fa-solid fa-clock-rotate-left"></i> <b>Exp:</b> ${l.experience || 'Not specified'}</div>
-                        <div class="wage-tag"><i class="fa-solid fa-money-bill-wave"></i> ${l.daily_wage || 'Daily Wage Negotiable'}</div>
-                    </div>
+  // Scroll to top
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
 
-                    <div>
-                        <div class="btn-group">
-                            <a href="tel:${l.phone}" class="btn-call">
-                                <i class="fa-solid fa-phone"></i> ${t.callWorker}
-                            </a>
-                            <a href="https://wa.me/${waPhone}?text=${waMsg}" target="_blank" class="btn-whatsapp">
-                                <i class="fa-brands fa-whatsapp"></i> ${t.whatsappChat}
-                            </a>
-                        </div>
+function toggleMobileMenu() {
+  const m = document.getElementById('mobileMenu');
+  m.style.display = m.style.display === 'none' ? 'block' : 'none';
+}
 
-                        ${isBusy ? `
-                            <button class="btn-release" onclick="releaseLabour(${l.id})">
-                                <i class="fa-solid fa-circle-check"></i> ${t.releaseBtn}
-                            </button>
-                        ` : `
-                            <button class="btn-hire" onclick="openHireModal(${l.id})">
-                                <i class="fa-solid fa-briefcase"></i> ${t.hireBtn}
-                            </button>
-                        `}
+// ─── LOAD STATS ──────────────────────────
+async function loadStats() {
+  try {
+    const [wRes, jRes] = await Promise.all([
+      fetch('/api/labours'),
+      fetch('/api/jobs')
+    ]);
+    const workers = await wRes.json();
+    const jobs = await jRes.json();
+    const cities = new Set(workers.map(w => w.location?.trim()).filter(Boolean)).size;
+    document.getElementById('stat-workers').textContent = workers.length + '+';
+    document.getElementById('stat-jobs').textContent = jobs.length + '+';
+    document.getElementById('stat-cities').textContent = cities + '+';
+  } catch(e) {
+    console.warn('Stats error', e);
+  }
+}
 
-                        <!-- ADMIN-ONLY DELETE BUTTON -->
-                        <button class="btn-admin-delete" onclick="adminDeleteLabour(${l.id})">
-                            <i class="fa-solid fa-trash"></i> Admin Delete
-                        </button>
-                    </div>
-                </div>
-                `;
-            }).join('');
-        }
+// ─── CATEGORIES ──────────────────────────
+function renderCategories() {
+  const grid = document.getElementById('categoryGrid');
+  if (!grid) return;
+  grid.innerHTML = CATEGORIES.map(cat => `
+    <div class="cat-card" onclick="filterByCategory('${cat.skill}')">
+      <div class="cat-icon">${cat.icon}</div>
+      <div class="cat-name">${cat.name[currentLang] || cat.name.en}</div>
+      <div class="cat-count">${countWorkersBySkill(cat.skill)} workers</div>
+    </div>
+  `).join('');
+}
 
-        function renderJobs(list) {
-            const container = document.getElementById('jobsList');
-            const t = i18n[currentLang];
-            if (list.length === 0) {
-                container.innerHTML = '<p style="color: #64748b; padding: 20px;">No active contractor jobs found.</p>';
-                return;
-            }
-            container.innerHTML = list.map(j => {
-                const waPhone = cleanPhoneForWhatsapp(j.phone);
-                const waMsg = encodeURIComponent(`Hello ${j.contractor_name}, I saw your job requirement for ${j.work_type} on ShramikLink. I would like to discuss.`);
-                
-                return `
-                <div class="item-card">
-                    <div>
-                        <div class="card-top">
-                            <div class="card-title">${j.work_type}</div>
-                            <span class="card-badge badge-job"><i class="fa-solid fa-people-group"></i> ${j.workers_needed} Required</span>
-                        </div>
-                        <div class="card-row"><i class="fa-solid fa-building-user"></i> <b>Posted By:</b> ${j.contractor_name}</div>
-                        <div class="card-row"><i class="fa-solid fa-location-dot"></i> <b>Site:</b> ${j.location}</div>
-                        <div class="wage-tag"><i class="fa-solid fa-coins"></i> Offered: ${j.wage_offered}</div>
-                        
-                        ${j.photo_data ? `
-                            <div style="font-size: 11px; color: var(--accent-gold); font-weight: 700; margin-top: 6px;">📷 Work / Problem Photo (Click to zoom):</div>
-                            <img src="${j.photo_data}" class="job-photo-preview" onclick="openLightbox('${j.photo_data}')" alt="Work Photo">
-                        ` : ''}
+function countWorkersBySkill(skill) {
+  if (!skill) return allWorkers.length;
+  return allWorkers.filter(w => w.skill && w.skill.toLowerCase().includes(skill.toLowerCase())).length;
+}
 
-                        <p style="font-size: 13px; color: #cbd5e1; background: #070a12; padding: 12px; border-radius: 8px; margin-top: 6px; border: 1px solid var(--border-color); line-height: 1.5;">
-                            ${j.requirements || 'No additional site requirements specified.'}
-                        </p>
-                    </div>
+function filterByCategory(skill) {
+  showPage('workers');
+  setTimeout(() => {
+    const f = document.getElementById('filterSearch');
+    if (f) { f.value = skill; applyWorkerFilters(); }
+  }, 100);
+}
 
-                    <div>
-                        <div class="btn-group">
-                            <a href="tel:${j.phone}" class="btn-call">
-                                <i class="fa-solid fa-phone"></i> ${t.callWorker}
-                            </a>
-                            <a href="https://wa.me/${waPhone}?text=${waMsg}" target="_blank" class="btn-whatsapp">
-                                <i class="fa-brands fa-whatsapp"></i> ${t.whatsappChat}
-                            </a>
-                        </div>
+function heroSearchGo() {
+  const q = document.getElementById('heroSearch').value.trim();
+  showPage('workers');
+  setTimeout(() => {
+    const f = document.getElementById('filterSearch');
+    if (f) { f.value = q; applyWorkerFilters(); }
+  }, 100);
+}
 
-                        <!-- ADMIN-ONLY DELETE BUTTON -->
-                        <button class="btn-admin-delete" onclick="adminDeleteJob(${j.id})">
-                            <i class="fa-solid fa-trash"></i> Admin Close Job
-                        </button>
-                    </div>
-                </div>
-                `;
-            }).join('');
-        }
+function heroSearchFilter() {
+  // live filter not needed on hero, just allow enter key
+}
 
-        function filterLabours() {
-            const query = document.getElementById('labourSearch').value.toLowerCase();
-            const skill = document.getElementById('labourSkillFilter').value.toLowerCase();
-            const filtered = allLabours.filter(l => {
-                const matchesQuery = l.name.toLowerCase().includes(query) || 
-                                     l.location.toLowerCase().includes(query) || 
-                                     l.skill.toLowerCase().includes(query);
-                const matchesSkill = !skill || l.skill.toLowerCase().includes(skill);
-                return matchesQuery && matchesSkill;
-            });
-            renderLabours(filtered);
-        }
+// ─── WORKERS ─────────────────────────────
+async function loadWorkers() {
+  const grid = document.getElementById('workersGrid');
+  grid.innerHTML = '<div class="spinner"></div>';
+  try {
+    const res = await fetch('/api/labours');
+    allWorkers = await res.json();
+    populateSkillFilter();
+    renderCategories();
+    applyWorkerFilters();
+  } catch(e) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><p>Could not load workers. Please refresh.</p></div>';
+  }
+}
 
-        function filterBySkill(trade) {
-            document.getElementById('labourSkillFilter').value = trade;
-            switchTab('tab-labours');
-            filterLabours();
-        }
+function populateSkillFilter() {
+  const sel = document.getElementById('filterSkill');
+  if (!sel) return;
+  const skills = [...new Set(allWorkers.map(w => w.skill).filter(Boolean))].sort();
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All Skills</option>' + skills.map(s => `<option value="${s}"${s===current?' selected':''}>${s}</option>`).join('');
+}
 
-        function filterJobs() {
-            const query = document.getElementById('jobSearch').value.toLowerCase();
-            const filtered = allJobs.filter(j => 
-                j.contractor_name.toLowerCase().includes(query) ||
-                j.work_type.toLowerCase().includes(query) ||
-                j.location.toLowerCase().includes(query) ||
-                j.requirements.toLowerCase().includes(query)
-            );
-            renderJobs(filtered);
-        }
+function applyWorkerFilters() {
+  const q = (document.getElementById('filterSearch')?.value || '').toLowerCase();
+  const status = document.getElementById('filterStatus')?.value || '';
+  const skill = document.getElementById('filterSkill')?.value || '';
+  const filtered = allWorkers.filter(w => {
+    const matchQ = !q || [w.name, w.skill, w.location, w.phone].some(f => f && f.toLowerCase().includes(q));
+    const matchStatus = !status || w.status === status;
+    const matchSkill = !skill || w.skill === skill;
+    return matchQ && matchStatus && matchSkill;
+  });
+  renderWorkers(filtered);
+}
 
-        async function submitLabour(e) {
-            e.preventDefault();
-            const phone = document.getElementById('labPhone').value.trim();
-            const data = {
-                name: document.getElementById('labName').value.trim(),
-                phone: phone,
-                skill: document.getElementById('labSkill').value,
-                location: document.getElementById('labLoc').value.trim(),
-                experience: document.getElementById('labExp').value.trim(),
-                daily_wage: document.getElementById('labWage').value.trim()
-            };
+function cleanPhone(phone) {
+  let p = (phone || '').replace(/\D/g, '');
+  if (p.length === 10) p = '91' + p;
+  return p;
+}
 
-            const res = await fetch('/api/labours', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
+function renderWorkers(list) {
+  const grid = document.getElementById('workersGrid');
+  if (!list.length) {
+    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">🔍</div><p>No workers found matching your search.</p></div>';
+    return;
+  }
+  grid.innerHTML = list.map(w => {
+    const busy = w.status === 'Busy';
+    const busyTag = busy && w.assigned_contractor ? `
+      <div class="busy-tag">🔴 Currently working with: <strong>${w.assigned_contractor}</strong></div>
+    ` : '';
+    const availableBadge = busy
+      ? `<span class="worker-status-badge status-busy">Busy</span>`
+      : `<span class="worker-status-badge status-available">Available</span>`;
+    const waPhone = cleanPhone(w.phone);
+    const waMsg = encodeURIComponent(`Hello ${w.name}, I found you on ShramikLink. Are you available for work?`);
+    const adminDeleteBtn = `<button class="btn btn-danger btn-sm admin-only" onclick="deleteWorker(${w.id})" style="display:none">🗑 Delete</button>`;
+    const assignBtn = busy
+      ? `<button class="btn btn-success btn-sm admin-only" style="display:none" onclick="markAvailable(${w.id})">🟢 Mark Available</button>`
+      : `<button class="btn btn-outline btn-sm" onclick="openHireModal(${w.id})">📋 Assign</button>`;
+    return `
+      <div class="worker-card">
+        ${availableBadge}
+        <div class="worker-card-top">
+          <div class="worker-avatar">👷</div>
+          <div class="worker-info">
+            <div class="worker-name">${w.name}</div>
+            <div class="worker-skill">${w.skill || 'General'}</div>
+            <div class="worker-loc">📍 ${w.location || 'Unknown'}</div>
+          </div>
+        </div>
+        ${busyTag}
+        <div class="worker-meta">
+          <div class="meta-item">
+            <div class="meta-label">Experience</div>
+            <div class="meta-value">${w.experience || '—'}</div>
+          </div>
+          <div class="meta-item">
+            <div class="meta-label">Daily Wage</div>
+            <div class="meta-value">₹${w.daily_wage || '—'}/day</div>
+          </div>
+        </div>
+        <div class="worker-actions">
+          <a href="tel:${w.phone}" class="btn btn-primary">📞 Call</a>
+          <a href="https://wa.me/${waPhone}?text=${waMsg}" target="_blank" class="btn btn-wa">💬 WhatsApp</a>
+          ${assignBtn}
+          ${adminDeleteBtn}
+        </div>
+        <div style="margin-top:10px">
+          <button class="btn btn-outline btn-sm btn-full" onclick="openReviewModal(${w.id}, '${w.name.replace(/'/g,"\\'")}')">⭐ Rate Worker</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+  // Re-apply admin visibility
+  if (document.body.classList.contains('is-admin')) {
+    document.querySelectorAll('.admin-only').forEach(el => el.style.display = 'inline-flex');
+  }
+}
 
-            const result = await res.json();
+// ─── HIRE / ASSIGN ───────────────────────
+function openHireModal(workerId) {
+  activeHireWorkerId = workerId;
+  document.getElementById('contractorNameInput').value = '';
+  document.getElementById('hireModalBackdrop').classList.remove('hidden');
+}
+function closeHireModal() {
+  document.getElementById('hireModalBackdrop').classList.add('hidden');
+  activeHireWorkerId = null;
+}
+async function confirmAssign() {
+  const name = document.getElementById('contractorNameInput').value.trim();
+  if (!name) { showToast('Please enter contractor name', 'error'); return; }
+  try {
+    const res = await fetch(`/api/labours/${activeHireWorkerId}/assign`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contractor_name: name, status: 'Busy' })
+    });
+    if (res.ok) {
+      closeHireModal();
+      showToast('Worker assigned to ' + name, 'success');
+      loadWorkers();
+    } else {
+      showToast('Failed to assign worker', 'error');
+    }
+  } catch(e) {
+    showToast('Network error', 'error');
+  }
+}
+async function markAvailable(workerId) {
+  try {
+    const res = await fetch(`/api/labours/${workerId}/assign`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contractor_name: '', status: 'Available' })
+    });
+    if (res.ok) { showToast('Worker marked as Available', 'success'); loadWorkers(); }
+  } catch(e) { showToast('Error', 'error'); }
+}
 
-            if (res.ok) {
-                showToast("Worker registered successfully!");
-                document.getElementById('formLabour').reset();
-                await fetchAllData();
-                switchTab('tab-labours');
-            } else {
-                showToast(result.error || "This mobile number is already registered!", true);
-            }
-        }
+// ─── DELETE WORKER (Admin only) ──────────
+async function deleteWorker(id) {
+  if (!confirm('Delete this worker permanently?')) return;
+  try {
+    const res = await fetch(`/api/labours/${id}`, {
+      method: 'DELETE',
+      headers: { 'X-Admin-PIN': ADMIN_PIN }
+    });
+    if (res.ok) { showToast('Worker deleted', 'success'); loadWorkers(); if (document.body.classList.contains('is-admin')) loadAdminData(); }
+    else showToast('Delete failed', 'error');
+  } catch(e) { showToast('Network error', 'error'); }
+}
 
-        async function submitJob(e) {
-            e.preventDefault();
-            const data = {
-                contractor_name: document.getElementById('jobContractor').value.trim(),
-                phone: document.getElementById('jobPhone').value.trim(),
-                work_type: document.getElementById('jobWorkType').value.trim(),
-                location: document.getElementById('jobLocation').value.trim(),
-                workers_needed: document.getElementById('jobWorkers').value,
-                wage_offered: document.getElementById('jobWage').value.trim(),
-                requirements: document.getElementById('jobReqs').value.trim(),
-                photo_data: jobPhotoBase64
-            };
+// ─── REVIEWS ─────────────────────────────
+function openReviewModal(workerId, workerName) {
+  activeReviewWorkerId = workerId;
+  document.getElementById('reviewerName').value = '';
+  document.getElementById('reviewRating').value = '5';
+  document.getElementById('reviewComment').value = '';
+  document.getElementById('reviewModalBackdrop').classList.remove('hidden');
+}
+function closeReviewModal() {
+  document.getElementById('reviewModalBackdrop').classList.add('hidden');
+  activeReviewWorkerId = null;
+}
+async function submitReview() {
+  const name = document.getElementById('reviewerName').value.trim();
+  const rating = parseInt(document.getElementById('reviewRating').value);
+  const comment = document.getElementById('reviewComment').value.trim();
+  if (!name) { showToast('Please enter your name', 'error'); return; }
+  try {
+    const res = await fetch(`/api/workers/${activeReviewWorkerId}/reviews`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewer_name: name, rating, comment })
+    });
+    if (res.ok) {
+      closeReviewModal();
+      showToast('Review submitted! Thank you.', 'success');
+    } else {
+      showToast('Failed to submit review', 'error');
+    }
+  } catch(e) { showToast('Network error', 'error'); }
+}
 
-            const res = await fetch('/api/jobs', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
+// ─── REGISTRATION WIZARD ─────────────────
+function wizardNext() {
+  if (!validateWizardStep(currentWizardStep)) return;
+  if (currentWizardStep === 1) {
+    fillReviewCard();
+  }
+  if (currentWizardStep === 2) {
+    submitRegistration();
+    return;
+  }
+  currentWizardStep++;
+  updateWizardUI();
+}
 
-            if (res.ok) {
-                showToast("Job requirement published with photo!");
-                document.getElementById('formJob').reset();
-                jobPhotoBase64 = '';
-                document.getElementById('jobPhotoPreviewBox').style.display = 'none';
-                await fetchAllData();
-                switchTab('tab-jobs');
-            } else {
-                showToast("Failed to publish requirement", true);
-            }
-        }
+function wizardBack() {
+  currentWizardStep = Math.max(0, currentWizardStep - 1);
+  updateWizardUI();
+}
 
-        function openHireModal(labourId) {
-            activeHireLabourId = labourId;
-            document.getElementById('hireModal').style.display = 'flex';
-        }
+function updateWizardUI() {
+  document.querySelectorAll('.wizard-step').forEach((s, i) => s.classList.toggle('active', i === currentWizardStep));
+  for (let i = 0; i < 4; i++) {
+    document.getElementById('wsd' + i).classList.toggle('active', i <= currentWizardStep);
+  }
+  const pct = ((currentWizardStep + 1) / 4 * 100).toFixed(0);
+  document.getElementById('wizardProgressFill').style.width = pct + '%';
+  const backBtn = document.getElementById('wizardBackBtn');
+  const nextBtn = document.getElementById('wizardNextBtn');
+  const nav = document.getElementById('wizardNav');
+  backBtn.style.display = currentWizardStep > 0 && currentWizardStep < 3 ? 'inline-flex' : 'none';
+  if (currentWizardStep === 2) {
+    nextBtn.textContent = '✅ Confirm & Register';
+  } else if (currentWizardStep === 3) {
+    nav.style.display = 'none';
+  } else {
+    nextBtn.textContent = 'Next Step →';
+  }
+}
 
-        function closeHireModal() {
-            document.getElementById('hireModal').style.display = 'none';
-            document.getElementById('hireContractorName').value = '';
-            activeHireLabourId = null;
-        }
+function validateWizardStep(step) {
+  if (step === 0) {
+    const name = document.getElementById('reg_name').value.trim();
+    const phone = document.getElementById('reg_phone').value.trim();
+    const loc = document.getElementById('reg_location').value.trim();
+    if (!name) { showToast('Please enter your name', 'error'); return false; }
+    if (!/^\d{10}$/.test(phone)) { showToast('Please enter a valid 10-digit mobile number', 'error'); return false; }
+    if (!loc) { showToast('Please enter your location', 'error'); return false; }
+  }
+  if (step === 1) {
+    const skill = document.getElementById('reg_skill').value.trim();
+    if (!skill) { showToast('Please enter your skill/trade', 'error'); return false; }
+  }
+  return true;
+}
 
-        async function confirmHire() {
-            const contractor = document.getElementById('hireContractorName').value.trim();
-            if (!contractor) {
-                alert("Please enter Contractor or Company name");
-                return;
-            }
+function fillReviewCard() {
+  const card = document.getElementById('regReviewCard');
+  card.innerHTML = `
+    <div><strong>Name:</strong> ${document.getElementById('reg_name').value}</div>
+    <div><strong>Phone:</strong> ${document.getElementById('reg_phone').value}</div>
+    <div><strong>Location:</strong> ${document.getElementById('reg_location').value}</div>
+    <div><strong>Skill:</strong> ${document.getElementById('reg_skill').value}</div>
+    <div><strong>Experience:</strong> ${document.getElementById('reg_experience').value || '—'}</div>
+    <div><strong>Daily Wage:</strong> ₹${document.getElementById('reg_wage').value || '—'}/day</div>
+  `;
+}
 
-            const res = await fetch(`/api/labours/${activeHireLabourId}/assign`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contractor_name: contractor })
-            });
+async function submitRegistration() {
+  const data = {
+    name: document.getElementById('reg_name').value.trim(),
+    phone: document.getElementById('reg_phone').value.trim(),
+    location: document.getElementById('reg_location').value.trim(),
+    skill: document.getElementById('reg_skill').value.trim(),
+    experience: document.getElementById('reg_experience').value.trim(),
+    daily_wage: document.getElementById('reg_wage').value.trim(),
+  };
+  try {
+    const res = await fetch('/api/labours', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.ok) {
+      currentWizardStep = 3;
+      updateWizardUI();
+      allWorkers = [];
+    } else if (res.status === 409) {
+      showToast('This phone number is already registered! / यह नंबर पहले से पंजीकृत है! / ఈ నంబర్ ఇప్పటికే నమోదు చేయబడింది!', 'error');
+    } else {
+      showToast('Registration failed. Please try again.', 'error');
+    }
+  } catch(e) {
+    showToast('Network error. Please try again.', 'error');
+  }
+}
 
-            if (res.ok) {
-                showToast(`Worker successfully assigned to ${contractor}!`);
-                closeHireModal();
-                fetchAllData();
-            } else {
-                showToast("Failed to assign worker", true);
-            }
-        }
+// ─── JOBS ─────────────────────────────────
+async function loadJobs() {
+  const grid = document.getElementById('jobsGrid');
+  grid.innerHTML = '<div class="spinner"></div>';
+  try {
+    const res = await fetch('/api/jobs');
+    allJobs = await res.json();
+    renderJobs(allJobs);
+  } catch(e) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><p>Could not load jobs. Please refresh.</p></div>';
+  }
+}
 
-        async function releaseLabour(id) {
-            const res = await fetch(`/api/labours/${id}/assign`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: "release" })
-            });
+function renderJobs(list) {
+  const grid = document.getElementById('jobsGrid');
+  if (!list.length) {
+    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">💼</div><p>No open jobs right now. Be the first to post one!</p><br/><button class="btn btn-primary" onclick="showPage(\'post\')">Post a Job</button></div>';
+    return;
+  }
+  grid.innerHTML = list.map(j => {
+    const waPhone = cleanPhone(j.phone);
+    const waMsg = encodeURIComponent(`Hello ${j.contractor_name}, I saw your job on ShramikLink for ${j.work_type} work. I am interested.`);
+    const photoHtml = j.photo_data ? `<img class="job-photo" src="${j.photo_data}" alt="Work photo" onclick="openLightbox('${j.photo_data}')"/>` : '';
+    const adminDeleteBtn = `<button class="btn btn-danger btn-sm admin-only" onclick="deleteJob(${j.id})" style="display:none">🗑 Delete</button>`;
+    return `
+      <div class="job-card">
+        <div class="job-header">
+          <div class="job-type-badge">${j.work_type || 'General Work'}</div>
+          <div class="job-title">Posted by: ${j.contractor_name}</div>
+          <div style="font-size:.78rem;color:var(--text-muted)">📅 ${j.created_at ? j.created_at.split(' ')[0] : 'Recently'}</div>
+        </div>
+        ${photoHtml}
+        <div class="job-meta-grid">
+          <div class="job-meta-item"><strong>📍 Location</strong>${j.location || '—'}</div>
+          <div class="job-meta-item"><strong>👷 Workers</strong>${j.workers_needed || '—'} needed</div>
+          <div class="job-meta-item"><strong>💰 Wage</strong>₹${j.wage_offered || '—'}/day</div>
+          <div class="job-meta-item"><strong>📋 Status</strong>${j.status || 'Open'}</div>
+        </div>
+        ${j.requirements ? `<p style="font-size:.85rem;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">${j.requirements}</p>` : ''}
+        <div class="job-actions">
+          <a href="tel:${j.phone}" class="btn btn-primary">📞 Call</a>
+          <a href="https://wa.me/${waPhone}?text=${waMsg}" target="_blank" class="btn btn-wa">💬 WhatsApp</a>
+          ${adminDeleteBtn}
+        </div>
+      </div>
+    `;
+  }).join('');
+  if (document.body.classList.contains('is-admin')) {
+    document.querySelectorAll('.admin-only').forEach(el => el.style.display = 'inline-flex');
+  }
+}
 
-            if (res.ok) {
-                showToast("Worker is now marked Available!");
-                fetchAllData();
-            }
-        }
+// ─── DELETE JOB (Admin only) ─────────────
+async function deleteJob(id) {
+  if (!confirm('Delete this job permanently?')) return;
+  try {
+    const res = await fetch(`/api/jobs/${id}`, {
+      method: 'DELETE',
+      headers: { 'X-Admin-PIN': ADMIN_PIN }
+    });
+    if (res.ok) { showToast('Job deleted', 'success'); loadJobs(); if (document.body.classList.contains('is-admin')) loadAdminData(); }
+    else showToast('Delete failed', 'error');
+  } catch(e) { showToast('Network error', 'error'); }
+}
 
-        async function adminDeleteLabour(id) {
-            if (!confirm("Admin Action: Remove this worker profile permanently?")) return;
-            const res = await fetch('/api/labours/' + id, {
-                method: 'DELETE',
-                headers: { 'X-Admin-PIN': currentAdminPin }
-            });
-            if (res.ok) {
-                showToast("Worker removed by Admin");
-                fetchAllData();
-            } else {
-                showToast("Admin authorization failed! Password required.", true);
-            }
-        }
+// ─── POST JOB ────────────────────────────
+function handlePhotoUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 5 * 1024 * 1024) { showToast('Photo must be under 5MB', 'error'); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    postPhotoData = e.target.result;
+    const preview = document.getElementById('photoPreview');
+    preview.src = postPhotoData;
+    preview.style.display = 'block';
+    document.getElementById('photoUploadZone').classList.add('has-photo');
+    document.getElementById('upload-text-hint').textContent = '✅ Photo selected! Click to change.';
+  };
+  reader.readAsDataURL(file);
+}
 
-        async function adminDeleteJob(id) {
-            if (!confirm("Admin Action: Close and remove this job posting?")) return;
-            const res = await fetch('/api/jobs/' + id, {
-                method: 'DELETE',
-                headers: { 'X-Admin-PIN': currentAdminPin }
-            });
-            if (res.ok) {
-                showToast("Job closed by Admin");
-                fetchAllData();
-            } else {
-                showToast("Admin authorization failed! Password required.", true);
-            }
-        }
+async function submitJob() {
+  const data = {
+    contractor_name: document.getElementById('post_cname').value.trim(),
+    phone: document.getElementById('post_cphone').value.trim(),
+    location: document.getElementById('post_location').value.trim(),
+    work_type: document.getElementById('post_work_type').value.trim(),
+    workers_needed: parseInt(document.getElementById('post_workers_needed').value) || 1,
+    wage_offered: document.getElementById('post_wage').value.trim(),
+    requirements: document.getElementById('post_requirements').value.trim(),
+    photo_data: postPhotoData,
+  };
+  if (!data.contractor_name) { showToast('Please enter your name', 'error'); return; }
+  if (!/^\d{10}$/.test(data.phone)) { showToast('Please enter a valid 10-digit mobile number', 'error'); return; }
+  if (!data.location) { showToast('Please enter work location', 'error'); return; }
+  if (!data.work_type) { showToast('Please enter work type', 'error'); return; }
+  const btn = document.getElementById('post-submit-btn');
+  btn.disabled = true; btn.textContent = 'Posting...';
+  try {
+    const res = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.ok) {
+      showToast('Job posted successfully! Workers will contact you.', 'success');
+      // Reset form
+      ['post_cname','post_cphone','post_location','post_work_type','post_workers_needed','post_wage','post_requirements'].forEach(id => document.getElementById(id).value = '');
+      postPhotoData = '';
+      document.getElementById('photoPreview').style.display = 'none';
+      document.getElementById('photoUploadZone').classList.remove('has-photo');
+      document.getElementById('upload-text-hint').textContent = 'Click to upload a photo of the work site or problem';
+      showPage('jobs');
+    } else {
+      showToast('Failed to post job. Please try again.', 'error');
+    }
+  } catch(e) { showToast('Network error', 'error'); }
+  finally { btn.disabled = false; btn.textContent = '📮 Post Job Now'; }
+}
 
-        async function handleRestore(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = async function(event) {
-                try {
-                    const payload = JSON.parse(event.target.result);
-                    const res = await fetch('/api/restore', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    if (res.ok) {
-                        showToast("Database restored successfully without data loss!");
-                        fetchAllData();
-                        switchTab('tab-labours');
-                    } else {
-                        showToast("Restore failed: Invalid backup structure", true);
-                    }
-                } catch (err) {
-                    showToast("Error reading backup file", true);
-                }
-            };
-            reader.readAsText(file);
-        }
+// ─── LIGHTBOX ────────────────────────────
+function openLightbox(src) {
+  document.getElementById('lightboxImg').src = src;
+  document.getElementById('lightbox').classList.remove('hidden');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.add('hidden');
+  document.getElementById('lightboxImg').src = '';
+}
+document.getElementById('lightbox').addEventListener('click', e => { if (e.target.id === 'lightbox') closeLightbox(); });
 
-        fetchAllData();
-    </script>
+// ─── ADMIN ───────────────────────────────
+async function loadAdminData() {
+  loadStats();
+  // Stats grid
+  try {
+    const [wRes, jRes] = await Promise.all([fetch('/api/labours'), fetch('/api/jobs')]);
+    const workers = await wRes.json();
+    const jobs = await jRes.json();
+    const available = workers.filter(w => w.status === 'Available').length;
+    const busy = workers.filter(w => w.status === 'Busy').length;
+    const cities = new Set(workers.map(w => w.location?.trim()).filter(Boolean)).size;
+    document.getElementById('adminStatsGrid').innerHTML = [
+      { label: 'Total Workers', value: workers.length, icon: '👷' },
+      { label: 'Available', value: available, icon: '✅' },
+      { label: 'Busy', value: busy, icon: '🔴' },
+      { label: 'Total Jobs', value: jobs.length, icon: '💼' },
+      { label: 'Open Jobs', value: jobs.filter(j=>j.status==='Open').length, icon: '📋' },
+      { label: 'Cities', value: cities, icon: '🏙️' },
+    ].map(s => `
+      <div style="background:var(--bg-page);padding:16px;border-radius:var(--radius-md);text-align:center">
+        <div style="font-size:1.6rem;margin-bottom:6px">${s.icon}</div>
+        <div style="font-size:1.5rem;font-weight:800;color:var(--brand-primary)">${s.value}</div>
+        <div style="font-size:.78rem;color:var(--text-muted)">${s.label}</div>
+      </div>
+    `).join('');
+
+    // Workers table
+    document.getElementById('adminWorkersTable').innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:.85rem">
+        <thead><tr style="background:var(--bg-page)">${['ID','Name','Phone','Location','Skill','Status','Action'].map(h=>`<th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap">${h}</th>`).join('')}</tr></thead>
+        <tbody>${workers.map(w=>`
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:10px 12px">${w.id}</td>
+            <td style="padding:10px 12px;font-weight:600">${w.name}</td>
+            <td style="padding:10px 12px">${w.phone}</td>
+            <td style="padding:10px 12px">${w.location||'—'}</td>
+            <td style="padding:10px 12px">${w.skill||'—'}</td>
+            <td style="padding:10px 12px"><span class="chip ${w.status==='Available'?'chip-green':'chip-orange'}">${w.status}</span></td>
+            <td style="padding:10px 12px"><button class="btn btn-danger btn-sm" onclick="deleteWorker(${w.id})">🗑</button></td>
+          </tr>
+        `).join('')}</tbody>
+      </table>`;
+
+    // Jobs table
+    document.getElementById('adminJobsTable').innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:.85rem">
+        <thead><tr style="background:var(--bg-page)">${['ID','Posted By','Phone','Location','Type','Workers','Wage','Action'].map(h=>`<th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap">${h}</th>`).join('')}</tr></thead>
+        <tbody>${jobs.map(j=>`
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:10px 12px">${j.id}</td>
+            <td style="padding:10px 12px;font-weight:600">${j.contractor_name}</td>
+            <td style="padding:10px 12px">${j.phone}</td>
+            <td style="padding:10px 12px">${j.location||'—'}</td>
+            <td style="padding:10px 12px">${j.work_type||'—'}</td>
+            <td style="padding:10px 12px">${j.workers_needed||'—'}</td>
+            <td style="padding:10px 12px">₹${j.wage_offered||'—'}</td>
+            <td style="padding:10px 12px"><button class="btn btn-danger btn-sm" onclick="deleteJob(${j.id})">🗑</button></td>
+          </tr>
+        `).join('')}</tbody>
+      </table>`;
+  } catch(e) { console.error('Admin load error', e); }
+}
+
+// ─── BACKUP / RESTORE ────────────────────
+async function downloadBackup() {
+  try {
+    const res = await fetch('/api/backup');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'shramiklink_backup_' + new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+    showToast('Backup downloaded!', 'success');
+  } catch(e) { showToast('Backup failed', 'error'); }
+}
+
+async function restoreBackup(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (!confirm('This will REPLACE all current data. Are you sure?')) { input.value=''; return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch('/api/restore', { method: 'POST', body: fd });
+    if (res.ok) { showToast('Restore successful! Reloading...', 'success'); setTimeout(()=>location.reload(), 1500); }
+    else showToast('Restore failed', 'error');
+  } catch(e) { showToast('Network error', 'error'); }
+}
+
+// ─── TOAST ───────────────────────────────
+function showToast(msg, type = 'info') {
+  const icons = { success:'✅', error:'❌', info:'ℹ️', warn:'⚠️' };
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `${icons[type]||''} ${msg}`;
+  document.getElementById('toastContainer').appendChild(toast);
+  setTimeout(() => toast.remove(), 4000);
+}
+
+// ─── SHAKE CSS (for wrong PIN) ───────────
+const shakeStyle = document.createElement('style');
+shakeStyle.textContent = `@keyframes shake { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-8px)} 40%{transform:translateX(8px)} 60%{transform:translateX(-5px)} 80%{transform:translateX(5px)} }`;
+document.head.appendChild(shakeStyle);
+
+// ─── INITIAL LOAD ─────────────────────────
+function loadInitialData() {
+  loadStats();
+  // Pre-load workers in background
+  fetch('/api/labours').then(r=>r.json()).then(d=>{
+    allWorkers=d;
+    renderCategories();
+    loadStats();
+  }).catch(()=>{});
+}
+</script>
 </body>
-</html>
-"""
+</html>"""
 
-# ─────────────────────────────────────────────────────────────
-# 3. BACKEND API ENDPOINTS
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# API ROUTES
+# ─────────────────────────────────────────────
 
-@app.route("/")
-def home():
-    return render_template_string(HTML_TEMPLATE)
+@app.route('/')
+def index():
+    return HTML_TEMPLATE
 
-@app.route("/api/labours", methods=["GET"])
+# ── WORKERS ──────────────────────────────────
+
+@app.route('/api/labours', methods=['GET'])
 def get_labours():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM labours ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM labours ORDER BY created_at DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
-@app.route("/api/labours", methods=["POST"])
+@app.route('/api/labours', methods=['POST'])
 def add_labour():
-    data = request.get_json()
-    phone = data.get("phone", "").strip()
-    clean_phone = re.sub(r'[^0-9+]', '', phone)
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name FROM labours WHERE phone = ? OR phone LIKE ?", (clean_phone, f"%{clean_phone[-10:]}%"))
-    existing = cursor.fetchone()
-    if existing:
-        conn.close()
+    data = request.json or {}
+    name  = data.get('name', '').strip()
+    phone = data.get('phone', '').strip()
+    location   = data.get('location', '').strip()
+    skill      = data.get('skill', '').strip()
+    experience = data.get('experience', '').strip()
+    daily_wage = data.get('daily_wage', '').strip()
+
+    if not name or not phone:
+        return jsonify({'error': 'Name and phone are required'}), 400
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO labours (name,phone,location,skill,experience,daily_wage) VALUES (?,?,?,?,?,?)",
+            (name, phone, location, skill, experience, daily_wage)
+        )
+        conn.commit()
+        return jsonify({'message': 'Worker registered successfully'}), 201
+    except sqlite3.IntegrityError:
         return jsonify({
-            "error": f"This mobile number is already registered for worker '{existing['name']}'! Please use another number. / यह नंबर पहले से उपयोग में है।"
+            'error': 'Phone number already registered! / यह नंबर पहले से पंजीकृत है! / ఈ నంబర్ ఇప్పటికే నమోదు చేయబడింది!'
         }), 409
 
-    cursor.execute("""
-        INSERT INTO labours (name, phone, location, skill, experience, daily_wage, status, assigned_contractor)
-        VALUES (?, ?, ?, ?, ?, ?, 'Available', '')
-    """, (
-        data.get("name"),
-        clean_phone,
-        data.get("location"),
-        data.get("skill"),
-        data.get("experience", "Not specified"),
-        data.get("daily_wage", "Negotiable")
-    ))
+@app.route('/api/labours/<int:labour_id>', methods=['DELETE'])
+def delete_labour(labour_id):
+    pin = request.headers.get('X-Admin-PIN', '')
+    if pin != ADMIN_PIN:
+        return jsonify({'error': 'Unauthorized'}), 403
+    conn = get_db()
+    conn.execute("DELETE FROM labours WHERE id=?", (labour_id,))
     conn.commit()
-    new_id = cursor.lastrowid
-    conn.close()
-    return jsonify({"id": new_id, "message": "Labour registered successfully"}), 201
+    return jsonify({'message': 'Worker deleted'})
 
-@app.route("/api/labours/<int:id>/assign", methods=["PATCH"])
-def assign_labour(id):
-    data = request.get_json()
-    action = data.get("action")
-    contractor = data.get("contractor_name", "").strip()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    if action == "release":
-        cursor.execute("UPDATE labours SET status = 'Available', assigned_contractor = '' WHERE id = ?", (id,))
-    else:
-        cursor.execute("UPDATE labours SET status = 'Busy', assigned_contractor = ? WHERE id = ?", (contractor, id))
-
+@app.route('/api/labours/<int:labour_id>/assign', methods=['PATCH'])
+def assign_labour(labour_id):
+    data = request.json or {}
+    contractor_name = data.get('contractor_name', '')
+    status = data.get('status', 'Busy')
+    conn = get_db()
+    conn.execute(
+        "UPDATE labours SET assigned_contractor=?, status=? WHERE id=?",
+        (contractor_name, status, labour_id)
+    )
     conn.commit()
-    conn.close()
-    return jsonify({"message": "Worker assignment updated"}), 200
+    return jsonify({'message': 'Worker updated'})
 
-@app.route("/api/labours/<int:id>", methods=["DELETE"])
-def delete_labour(id):
-    admin_pin = request.headers.get("X-Admin-PIN")
-    if admin_pin != ADMIN_PIN:
-        return jsonify({"error": "Unauthorized. Admin Password required."}), 403
+# ── JOBS ─────────────────────────────────────
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM labours WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-    return jsonify({"message": f"Labour {id} deleted by Admin"}), 200
-
-@app.route("/api/jobs", methods=["GET"])
+@app.route('/api/jobs', methods=['GET'])
 def get_jobs():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM contractor_jobs ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM contractor_jobs ORDER BY created_at DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
-@app.route("/api/jobs", methods=["POST"])
+@app.route('/api/jobs', methods=['POST'])
 def add_job():
-    data = request.get_json()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO contractor_jobs (contractor_name, phone, location, work_type, workers_needed, wage_offered, requirements, photo_data, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Open')
+    data = request.json or {}
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO contractor_jobs
+          (contractor_name, phone, location, work_type, workers_needed, wage_offered, requirements, photo_data)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (
-        data.get("contractor_name"),
-        data.get("phone"),
-        data.get("location"),
-        data.get("work_type"),
-        data.get("workers_needed", 1),
-        data.get("wage_offered"),
-        data.get("requirements", ""),
-        data.get("photo_data", "")
+        data.get('contractor_name', ''),
+        data.get('phone', ''),
+        data.get('location', ''),
+        data.get('work_type', ''),
+        data.get('workers_needed', 1),
+        data.get('wage_offered', ''),
+        data.get('requirements', ''),
+        data.get('photo_data', ''),
     ))
     conn.commit()
-    new_id = cursor.lastrowid
-    conn.close()
-    return jsonify({"id": new_id, "message": "Job requirement created"}), 201
+    return jsonify({'message': 'Job posted successfully'}), 201
 
-@app.route("/api/jobs/<int:id>", methods=["DELETE"])
-def delete_job(id):
-    admin_pin = request.headers.get("X-Admin-PIN")
-    if admin_pin != ADMIN_PIN:
-        return jsonify({"error": "Unauthorized. Admin Password required."}), 403
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM contractor_jobs WHERE id = ?", (id,))
+@app.route('/api/jobs/<int:job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    pin = request.headers.get('X-Admin-PIN', '')
+    if pin != ADMIN_PIN:
+        return jsonify({'error': 'Unauthorized'}), 403
+    conn = get_db()
+    conn.execute("DELETE FROM contractor_jobs WHERE id=?", (job_id,))
     conn.commit()
-    conn.close()
-    return jsonify({"message": f"Job {id} closed by Admin"}), 200
+    return jsonify({'message': 'Job deleted'})
 
-@app.route("/api/backup", methods=["GET"])
-def backup_database():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM labours")
-    labours = [dict(r) for r in cursor.fetchall()]
-    cursor.execute("SELECT * FROM contractor_jobs")
-    jobs = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+# ── REVIEWS ──────────────────────────────────
 
-    backup_data = {
-        "app": "ShramikLink",
-        "version": "4.0-enterprise",
-        "exported_at": datetime.utcnow().isoformat() + "Z",
-        "total_labours": len(labours),
-        "total_jobs": len(jobs),
-        "labours": labours,
-        "contractor_jobs": jobs
-    }
-
-    return Response(
-        json.dumps(backup_data, indent=2),
-        mimetype="application/json",
-        headers={"Content-Disposition": f"attachment;filename=shramiklink_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"}
+@app.route('/api/workers/<int:worker_id>/reviews', methods=['POST'])
+def add_review(worker_id):
+    data = request.json or {}
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO worker_reviews (worker_id, reviewer_name, rating, comment) VALUES (?,?,?,?)",
+        (worker_id, data.get('reviewer_name',''), data.get('rating', 5), data.get('comment',''))
     )
-
-@app.route("/api/restore", methods=["POST"])
-def restore_database():
-    data = request.get_json()
-    if not data or "labours" not in data or "contractor_jobs" not in data:
-        return jsonify({"error": "Invalid backup file structure"}), 400
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM labours")
-    cursor.execute("DELETE FROM contractor_jobs")
-
-    for l in data["labours"]:
-        cursor.execute("""
-            INSERT INTO labours (name, phone, location, skill, experience, daily_wage, status, assigned_contractor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (l["name"], l["phone"], l["location"], l["skill"], l.get("experience", ""), l.get("daily_wage", ""), l.get("status", "Available"), l.get("assigned_contractor", "")))
-
-    for j in data["contractor_jobs"]:
-        cursor.execute("""
-            INSERT INTO contractor_jobs (contractor_name, phone, location, work_type, workers_needed, wage_offered, requirements, photo_data, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (j["contractor_name"], j["phone"], j["location"], j["work_type"], j.get("workers_needed", 1), j.get("wage_offered", ""), j.get("requirements", ""), j.get("photo_data", ""), j.get("status", "Open")))
-
     conn.commit()
-    conn.close()
-    return jsonify({"message": "Database restored successfully", "labours_restored": len(data["labours"]), "jobs_restored": len(data["contractor_jobs"])}), 200
+    return jsonify({'message': 'Review submitted'}), 201
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+@app.route('/api/workers/<int:worker_id>/reviews', methods=['GET'])
+def get_reviews(worker_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM worker_reviews WHERE worker_id=? ORDER BY created_at DESC",
+        (worker_id,)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+# ── STATS ─────────────────────────────────────
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    conn = get_db()
+    workers_count = conn.execute("SELECT COUNT(*) FROM labours").fetchone()[0]
+    jobs_count = conn.execute("SELECT COUNT(*) FROM contractor_jobs WHERE status='Open'").fetchone()[0]
+    cities_count = conn.execute("SELECT COUNT(DISTINCT location) FROM labours WHERE location != ''").fetchone()[0]
+    return jsonify({
+        'workers': workers_count,
+        'jobs': jobs_count,
+        'cities': cities_count,
+    })
+
+# ── BACKUP / RESTORE ─────────────────────────
+
+@app.route('/api/backup', methods=['GET'])
+def backup():
+    conn = get_db()
+    labours = [dict(r) for r in conn.execute("SELECT * FROM labours").fetchall()]
+    jobs    = [dict(r) for r in conn.execute("SELECT * FROM contractor_jobs").fetchall()]
+    reviews = [dict(r) for r in conn.execute("SELECT * FROM worker_reviews").fetchall()]
+    data = json.dumps({'labours': labours, 'contractor_jobs': jobs, 'worker_reviews': reviews}, ensure_ascii=False, indent=2)
+    buf = BytesIO(data.encode('utf-8'))
+    buf.seek(0)
+    return send_file(buf, mimetype='application/json',
+                     download_name='shramiklink_backup.json', as_attachment=True)
+
+@app.route('/api/restore', methods=['POST'])
+def restore():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file provided'}), 400
+    try:
+        data = json.loads(file.read().decode('utf-8'))
+    except Exception as e:
+        return jsonify({'error': 'Invalid JSON: ' + str(e)}), 400
+
+    conn = get_db()
+    if 'labours' in data:
+        conn.execute("DELETE FROM labours")
+        for row in data['labours']:
+            conn.execute("""
+                INSERT OR IGNORE INTO labours
+                  (id, name, phone, location, skill, experience, daily_wage, status, assigned_contractor, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (row.get('id'), row.get('name'), row.get('phone'), row.get('location'),
+                  row.get('skill'), row.get('experience'), row.get('daily_wage'),
+                  row.get('status','Available'), row.get('assigned_contractor',''), row.get('created_at','')))
+    if 'contractor_jobs' in data:
+        conn.execute("DELETE FROM contractor_jobs")
+        for row in data['contractor_jobs']:
+            conn.execute("""
+                INSERT OR IGNORE INTO contractor_jobs
+                  (id, contractor_name, phone, location, work_type, workers_needed, wage_offered, requirements, photo_data, status, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (row.get('id'), row.get('contractor_name'), row.get('phone'), row.get('location'),
+                  row.get('work_type'), row.get('workers_needed'), row.get('wage_offered'),
+                  row.get('requirements'), row.get('photo_data',''), row.get('status','Open'), row.get('created_at','')))
+    if 'worker_reviews' in data:
+        conn.execute("DELETE FROM worker_reviews")
+        for row in data['worker_reviews']:
+            conn.execute("""
+                INSERT OR IGNORE INTO worker_reviews
+                  (id, worker_id, reviewer_name, rating, comment, created_at)
+                VALUES (?,?,?,?,?,?)
+            """, (row.get('id'), row.get('worker_id'), row.get('reviewer_name'),
+                  row.get('rating'), row.get('comment'), row.get('created_at','')))
+    conn.commit()
+    return jsonify({'message': 'Restore successful'})
+
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
